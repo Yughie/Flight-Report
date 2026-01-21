@@ -1,0 +1,22 @@
+venv
+screenshots
+*.log
+.DS_Store
+__pycache__/
+*.pyc
+.env
+.idea/
+.vscode/
+node_modules/
+dist/
+
+# Environment variables
+.env
+
+# Python
+__pycache__/
+*.pyc
+venv/
+
+# Node
+node_modules/

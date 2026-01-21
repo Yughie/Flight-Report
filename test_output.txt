@@ -1,0 +1,22 @@
+=== LIVE DASHBOARD DATA (Extracted via Vision AI) ===
+
+📊 Dashboard: Sample
+📅 Time Period: Jan 2025
+
+⏰ DELAY CAUSES:
+  • Departure Delay: 4.41 (17.96%)
+  • Arrival Delay: 4.29 (17.48%)
+  • Late Aircraft Delay: 3.47 (14.12%)
+  • Airline Delay: 2.46 (10.04%)
+  • Air System Delay: 9.37 (38.18%)
+
+=======================================================
+
+--- COMPUTED DELAY CAUSES SUMMARY ---
+  • Air System Delay: 9.37 — 39.05%
+  • Departure Delay: 4.41 — 18.37%
+  • Arrival Delay: 4.29 — 17.88%
+  • Late Aircraft Delay: 3.47 — 14.44%
+  • Airline Delay: 2.46 — 10.27%
+Top cause by share: Air System Delay (39.05%)
+=======================================================
