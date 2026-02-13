@@ -4,23 +4,187 @@ import json
 import streamlit.components.v1 as components
 import os
 from dotenv import load_dotenv
+from promptAI import llm
+
+# Must be first Streamlit command
+st.set_page_config(page_title="AI Flight Report", layout="wide")
 
 # Load environment variables from .env file
 load_dotenv()
 
-# --- 1. CONFIGURATION (from secrets.toml) ---
+# --- 1. CONFIGURATION ---
 TENANT_ID = os.getenv("POWERBI_TENANT_ID")
 CLIENT_ID = os.getenv("POWERBI_CLIENT_ID")
 CLIENT_SECRET = os.getenv("POWERBI_CLIENT_SECRET")
 WORKSPACE_ID = os.getenv("POWERBI_WORKSPACE_ID")
 REPORT_ID = os.getenv("POWERBI_REPORT_ID")
 
-# --- 2. FUNCTION TO GET ACCESS TOKEN ---
+# Available airlines for validation (from airlines.csv)
+VALID_AIRLINES = [
+    "United Air Lines Inc.",
+    "American Airlines Inc.",
+    "US Airways Inc.",
+    "Frontier Airlines Inc.",
+    "JetBlue Airways",
+    "Skywest Airlines Inc.",
+    "Alaska Airlines Inc.",
+    "Spirit Air Lines",
+    "Southwest Airlines Co.",
+    "Delta Air Lines Inc.",
+    "Atlantic Southeast Airlines",
+    "Hawaiian Airlines Inc.",
+    "American Eagle Airlines Inc.",
+    "Virgin America"
+]
+
+# Dataset timeline bounds (clamp defaults and parsed dates to this range)
+DATA_MIN_DATE = "2015-01-01"
+DATA_MAX_DATE = "2015-12-31"
+
+# --- 2. AI FILTER EXTRACTION ---
+def extract_airline_filter(user_message: str, chat_history: list) -> dict:
+    """
+    Use LLM to extract airline name from user message.
+    Returns dict with 'action' (filter/clear/none) and 'airline' if applicable.
+    """
+    airlines_list = "\n".join(f"- {a}" for a in VALID_AIRLINES)
+    
+    system_prompt = f"""You are an AI assistant that helps control a Power BI flight report.
+Your job is to understand user requests about filtering by airline and/or flight date range and extract parameters.
+
+Important: The dataset only contains flights in the 2015 timeline. All dates must be within 2015.
+
+Available airlines:
+{airlines_list}
+
+Instructions:
+1. If the user wants to filter by an airline, respond with EXACTLY:
+    ACTION: filter
+    AIRLINE: [exact airline name from the list]
+
+2. If the user wants to filter by a date range (between two dates), include both of these lines in YYYY-MM-DD format:
+    DATE_FROM: YYYY-MM-DD
+    DATE_TO: YYYY-MM-DD
+    If the user asks to filter by date but does not provide specific dates, set DATE_FROM to 2015-01-01 and DATE_TO to 2015-12-31.
+
+3. If the user provides only one date, determine context and return only the relevant key:
+   - Phrases like "go to [date]", "until [date]", "by [date]", "end on [date]" → return DATE_TO: [date]
+   - Phrases like "start from [date]", "begin [date]", "after [date]" → return DATE_FROM: [date]
+   - If unclear, default to DATE_TO for single dates
+   The application will preserve the other bound if already set.
+
+4. If the user wants to clear/reset/remove all filters, respond with EXACTLY:
+    ACTION: clear
+
+5. If the user asks a general question or the message is not about filtering, respond with:
+    ACTION: none
+    MESSAGE: [your helpful response]
+
+6. If the user mentions an airline name but it's not exact, match it to the closest one from the list.
+    For example: "Delta" -> "Delta Air Lines Inc.", "Southwest" -> "Southwest Airlines Co."
+
+Be strict about matching to valid airline names only. Always output only the specified keys (ACTION, AIRLINE, DATE_FROM, DATE_TO, MESSAGE) on separate lines.
+"""
+
+    # Build conversation context
+    messages = [{"role": "system", "content": system_prompt}]
+    
+    # Add recent chat history for context (last 4 messages)
+    for msg in chat_history[-4:]:
+        messages.append({"role": msg["role"], "content": msg["content"]})
+    
+    messages.append({"role": "user", "content": user_message})
+    
+    try:
+        response = llm.invoke(messages)
+        content = response.content if hasattr(response, 'content') else str(response)
+        
+        # Parse the response
+        lines = content.strip().split('\n')
+        result = {"action": "none", "airline": None, "date_from": None, "date_to": None, "message": content}
+
+        def normalize_date(s: str):
+            s = s.strip()
+            import re
+            if not s:
+                return None
+            # If already ISO-like
+            try:
+                import datetime as _dt
+                min_d = _dt.date.fromisoformat(DATA_MIN_DATE)
+                max_d = _dt.date.fromisoformat(DATA_MAX_DATE)
+            except Exception:
+                min_d = None
+                max_d = None
+
+            if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
+                try:
+                    d = _dt.date.fromisoformat(s)
+                except Exception:
+                    return None
+                if min_d and d < min_d:
+                    d = min_d
+                if max_d and d > max_d:
+                    d = max_d
+                return d.isoformat()
+
+            # Try to parse common formats using dateutil if available
+            try:
+                from dateutil import parser
+                dt = parser.parse(s)
+                d = dt.date()
+                if min_d and d < min_d:
+                    d = min_d
+                if max_d and d > max_d:
+                    d = max_d
+                return d.isoformat()
+            except Exception:
+                # Fallback: attempt to extract YYYY-MM-DD
+                m = re.search(r"(\d{4}-\d{2}-\d{2})", s)
+                if m:
+                    try:
+                        d = _dt.date.fromisoformat(m.group(1))
+                        if min_d and d < min_d:
+                            d = min_d
+                        if max_d and d > max_d:
+                            d = max_d
+                        return d.isoformat()
+                    except Exception:
+                        return None
+            return None
+
+        for line in lines:
+            if line.startswith("ACTION:"):
+                result["action"] = line.replace("ACTION:", "").strip().lower()
+            elif line.startswith("AIRLINE:"):
+                airline = line.replace("AIRLINE:", "").strip()
+                # Validate airline exists
+                if airline in VALID_AIRLINES:
+                    result["airline"] = airline
+                else:
+                    # Fuzzy match
+                    for valid in VALID_AIRLINES:
+                        if airline and (airline.lower() in valid.lower() or valid.lower() in airline.lower()):
+                            result["airline"] = valid
+                            break
+            elif line.startswith("DATE_FROM:"):
+                df = line.replace("DATE_FROM:", "").strip()
+                result["date_from"] = normalize_date(df)
+            elif line.startswith("DATE_TO:"):
+                dt = line.replace("DATE_TO:", "").strip()
+                result["date_to"] = normalize_date(dt)
+            elif line.startswith("MESSAGE:"):
+                result["message"] = line.replace("MESSAGE:", "").strip()
+
+        return result
+    except Exception as e:
+        return {"action": "none", "airline": None, "message": f"Error processing request: {str(e)}"}
+
+# --- 3. FUNCTION TO GET ACCESS TOKEN ---
 def get_embed_params():
     # 1. Get Azure AD Access Token
     auth_url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
     
-    # Ensure these keys are exactly lowercase
     auth_data = {
         "grant_type": "client_credentials",
         "client_id": CLIENT_ID,
@@ -28,8 +192,6 @@ def get_embed_params():
         "scope": "https://analysis.windows.net/powerbi/api/.default"
     }
     
-    # CRITICAL: Use 'data=' instead of 'json='
-    # Azure expects x-www-form-urlencoded format
     auth_res = requests.post(auth_url, data=auth_data)
     
     if auth_res.status_code != 200:
@@ -45,17 +207,15 @@ def get_embed_params():
     
     report_res = requests.get(report_url, headers=headers)
     
-    # --- THIS IS WHERE YOUR ERROR IS HAPPENING ---
     if report_res.status_code != 200:
         st.error(f"Power BI API Failed ({report_res.status_code})")
         st.info("Check if your Service Principal (App) is a Member of the Power BI Workspace.")
-        st.write("Full Error from Microsoft:", report_res.text) # This reveals the truth!
+        st.write("Full Error from Microsoft:", report_res.text)
         return None, None
 
     embed_data = report_res.json()
 
-    # 3. Generate an embed token from the Power BI REST API (do NOT pass the AAD token directly
-    #    to the browser). The embed token is what the Power BI JS SDK expects on the client.
+    # 3. Generate an embed token
     generate_url = f"https://api.powerbi.com/v1.0/myorg/groups/{WORKSPACE_ID}/reports/{REPORT_ID}/GenerateToken"
     generate_body = {"accessLevel": "View"}
     generate_res = requests.post(generate_url, headers=headers, json=generate_body)
@@ -71,40 +231,94 @@ def get_embed_params():
     embed_token = generate_res.json().get("token")
     return embed_data.get("embedUrl"), embed_token
 
-# --- 3. STREAMLIT UI ---
-st.title("AI-Controlled Power BI Report")
 
-# Initialize session state
-if 'report_loaded' not in st.session_state:
-    st.session_state.report_loaded = False
-if 'embed_token' not in st.session_state:
-    st.session_state.embed_token = None
-if 'embed_url' not in st.session_state:
-    st.session_state.embed_url = None
+# --- 4. POWER BI COMPONENT WITH FILTER SUPPORT ---
+def render_powerbi_report(embed_token: str, embed_url: str, airline_filter: str = None, date_from: str = None, date_to: str = None):
+    """
+    Render Power BI report with optional airline filter applied on load.
+    """
+    # Prepare filter JavaScript: build combined filters (airline basic + date advanced) when provided
+    # Date values passed from Python are ISO-like YYYY-MM-DD or None
+    df_val = date_from or ""
+    dt_val = date_to or ""
+    af_val = airline_filter or ""
+    filter_js = f"""
+        report.on('loaded', async function() {{
+            try {{
+                const filters = [];
 
-# Button layout
-col1, col2 = st.columns([1, 1])
-with col1:
-    if st.button("Load Report"):
-        with st.spinner("Loading Power BI Report..."):
-            embed_url, token = get_embed_params()
-            if embed_url and token:
-                st.session_state.embed_url = embed_url
-                st.session_state.embed_token = token
-                st.session_state.report_loaded = True
-                st.rerun()
+                // Airline basic filter
+                if ("{af_val}") {{
+                    filters.push({{
+                        $schema: "http://powerbi.com/product/schema#basic",
+                        target: {{ table: "gold_aviation_report", column: "AIRLINE_NAME" }},
+                        operator: "In",
+                        values: ["{af_val}"],
+                        filterType: models.FilterType.BasicFilter
+                    }});
+                }}
 
-with col2:
-    if st.button("Clear Report") and st.session_state.report_loaded:
-        st.session_state.report_loaded = False
-        st.session_state.embed_token = None
-        st.session_state.embed_url = None
-        st.rerun()
+                    // Try to synchronize slicer visuals so the slicer UI shows the selection
+                    try {{
+                        const pages = await report.getPages();
+                        for (const p of pages) {{
+                            const visuals = await p.getVisuals();
+                            for (const v of visuals) {{
+                                // Look for slicer visuals that likely target the airline column
+                                if (v.type === 'slicer') {{
+                                    const title = (v.title || '').toString().toLowerCase();
+                                    const name = (v.name || '').toString().toLowerCase();
+                                    if (title.includes('airline') || name.includes('airline')) {{
+                                        try {{
+                                            if ("{af_val}" && "{af_val}" !== "") {{
+                                                await v.setSlicerState({{ slicerState: {{ selectedValues: ["{af_val}"] }} }});
+                                                console.log('Slicer synced for', v.name || v.title, '{af_val}');
+                                            }} else {{
+                                                try {{ await v.setSlicerState({{ slicerState: {{ selectedValues: [] }} }}); }} catch (e) {{}}
+                                            }}
+                                        }} catch (err) {{
+                                            console.warn('Failed to set slicer state on visual', v.name || v.title, err);
+                                        }}
+                                    }}
+                                }}
+                            }}
+                        }}
+                    }} catch (err) {{
+                        console.warn('Slicer sync error:', err);
+                    }}
+                // Date advanced filter
+                if ("{df_val}" || "{dt_val}") {{
+                    const dateFilter = {{
+                        $schema: "http://powerbi.com/product/schema#advanced",
+                        target: {{ table: "gold_aviation_report", column: "FLIGHT_DATE" }},
+                        logicalOperator: "And",
+                        conditions: [],
+                        filterType: models.FilterType.AdvancedFilter
+                    }};
+                    if ("{df_val}") {{
+                        dateFilter.conditions.push({{ operator: "GreaterThanOrEqual", value: new Date("{df_val}T00:00:00.000Z") }});
+                    }}
+                    if ("{dt_val}") {{
+                        dateFilter.conditions.push({{ operator: "LessThanOrEqual", value: new Date("{dt_val}T23:59:59.999Z") }});
+                    }}
+                    filters.push(dateFilter);
+                }}
 
-# Show the embedded report if loaded
-if st.session_state.report_loaded and st.session_state.embed_token and st.session_state.embed_url:
-    # This is where the JavaScript "AI control" lives
-    # We use st.components.v1.html to bridge Python and the Power BI JS SDK
+                // Apply filters
+                if (filters.length > 0) {{
+                    await report.setFilters(filters);
+                    console.log('AI Filters applied:', filters);
+                }} else {{
+                    await report.removeFilters();
+                    console.log('All filters cleared');
+                }}
+            }} catch (err) {{
+                console.error('Filter application error:', err);
+                console.log('Error details:', err.message);
+            }}
+        }});
+    """
+    
     pbi_html = f"""
     <div id="reportContainer" style="height: 600px; width: 100%;"></div>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/powerbi-client/2.19.1/powerbi.min.js"></script>
@@ -113,8 +327,8 @@ if st.session_state.report_loaded and st.session_state.embed_token and st.sessio
         var config = {{
             type: 'report',
             tokenType: models.TokenType.Embed,
-            accessToken: '{st.session_state.embed_token}',
-            embedUrl: '{st.session_state.embed_url}',
+            accessToken: '{embed_token}',
+            embedUrl: '{embed_url}',
             id: '{REPORT_ID}',
             settings: {{
                 filterPaneEnabled: false,
@@ -124,26 +338,170 @@ if st.session_state.report_loaded and st.session_state.embed_token and st.sessio
 
         var reportContainer = document.getElementById('reportContainer');
         var report = powerbi.embed(reportContainer, config);
-
-        // This function is what your "AI" will call via message passing later
-        window.applyAIFilter = async function(value) {{
-            const pages = await report.getPages();
-            const activePage = pages.find(p => p.isActive);
-            const visuals = await activePage.getVisuals();
-            const slicer = visuals.find(v => v.type === 'slicer'); // Finds the first slicer
-
-            const filter = {{
-                $schema: "http://powerbi.com/product/schema#basic",
-                target: {{ table: "Store", column: "Count" }}, // EDIT THESE TO MATCH YOUR DATA
-                operator: "In",
-                values: [value],
-                filterType: models.FilterType.BasicFilter
-            }};
-
-            await slicer.setSlicerState({{ filters: [filter] }});
-        }};
+        
+        {filter_js}
     </script>
     """
     components.html(pbi_html, height=650)
+
+# --- 5. STREAMLIT UI ---
+st.title("🛫 AI-Controlled Power BI Report")
+
+# Initialize session state
+if 'report_loaded' not in st.session_state:
+    st.session_state.report_loaded = False
+if 'embed_token' not in st.session_state:
+    st.session_state.embed_token = None
+if 'embed_url' not in st.session_state:
+    st.session_state.embed_url = None
+if 'chat_history' not in st.session_state:
+    st.session_state.chat_history = []
+if 'current_airline_filter' not in st.session_state:
+    st.session_state.current_airline_filter = None
+if 'current_date_from' not in st.session_state:
+    st.session_state.current_date_from = None
+if 'current_date_to' not in st.session_state:
+    st.session_state.current_date_to = None
+
+# Sidebar for chat
+with st.sidebar:
+    st.header("💬 AI Assistant")
+    st.markdown("Ask me to filter the report by airline!")
+    st.divider()
+    
+    # Current filter status
+    active_filters = []
+    if st.session_state.current_airline_filter:
+        active_filters.append(f"Airline: **{st.session_state.current_airline_filter}**")
+    if st.session_state.current_date_from or st.session_state.current_date_to:
+        df = st.session_state.current_date_from or "(start)"
+        dt = st.session_state.current_date_to or "(end)"
+        active_filters.append(f"Dates: **{df}** to **{dt}**")
+    
+    if active_filters:
+        st.success("🎯 **Active Filters:**")
+        for filter_text in active_filters:
+            st.write(filter_text)
+        if st.button("🗑️ Clear All Filters", use_container_width=True):
+            st.session_state.current_airline_filter = None
+            st.session_state.current_date_from = None
+            st.session_state.current_date_to = None
+            st.session_state.chat_history.append({
+                "role": "assistant", 
+                "content": "All filters cleared."
+            })
+            st.rerun()
+    else:
+        st.info("No filters active")
+    
+    st.divider()
+    
+    # Chat history display
+    chat_container = st.container(height=300)
+    with chat_container:
+        for msg in st.session_state.chat_history:
+            if msg["role"] == "user":
+                st.markdown(f"**You:** {msg['content']}")
+            else:
+                st.markdown(f"**AI:** {msg['content']}")
+    
+    # Chat input
+    user_input = st.chat_input("Type your request...", key="chat_input")
+    
+    if user_input:
+        # Add user message to history
+        st.session_state.chat_history.append({"role": "user", "content": user_input})
+        
+        # Process with AI
+        with st.spinner("Processing..."):
+            result = extract_airline_filter(user_input, st.session_state.chat_history)
+        
+        # Handle the result
+        if result.get("action") == "filter":
+            parts = []
+            # Airline
+            if result.get("airline"):
+                st.session_state.current_airline_filter = result.get("airline")
+                parts.append(f"**{st.session_state.current_airline_filter}**")
+
+            # Date range (only set when provided). Preserve existing older/lower date if not mentioned.
+            if result.get("date_from") or result.get("date_to"):
+                existing_from = st.session_state.current_date_from
+                existing_to = st.session_state.current_date_to
+
+                rf = result.get("date_from")
+                rt = result.get("date_to")
+
+                if rf and rt:
+                    df = rf
+                    dt = rt
+                    parts.append(f"dates {df} to {dt}")
+                elif rf and not rt:
+                    # Only lower/older date provided: keep upper if set, otherwise default to dataset max
+                    df = rf
+                    dt = existing_to or DATA_MAX_DATE
+                    parts.append(f"start date to **{df}** (end: {dt})")
+                elif rt and not rf:
+                    # Only upper/newer date provided: keep lower if set, otherwise default to dataset min
+                    dt = rt
+                    df = existing_from or DATA_MIN_DATE
+                    parts.append(f"end date to **{rt}** (start: {df})")
+                else:
+                    df = existing_from or DATA_MIN_DATE
+                    dt = existing_to or DATA_MAX_DATE
+                    parts.append(f"dates {df} to {dt}")
+
+                st.session_state.current_date_from = df
+                st.session_state.current_date_to = dt
+
+            if parts:
+                response = "✅ Filtering by " + " and ".join(parts)
+            else:
+                # No concrete filter detected; show AI message
+                response = result.get("message") or "No filters detected."
+
+            st.session_state.chat_history.append({"role": "assistant", "content": response})
+        elif result.get("action") == "clear":
+            st.session_state.current_airline_filter = None
+            st.session_state.current_date_from = None
+            st.session_state.current_date_to = None
+            response = "✅ Filters cleared. Showing all airlines."
+            st.session_state.chat_history.append({"role": "assistant", "content": response})
+        else:
+            st.session_state.chat_history.append({"role": "assistant", "content": result.get("message")})
+        
+        st.rerun()
+    
+    # Clear chat button
+    if st.button("🔄 Clear Chat History", use_container_width=True):
+        st.session_state.chat_history = []
+        st.rerun()
+
+# Main content area
+# Auto-load the report once when the app starts (removes manual Load/Close buttons)
+if not st.session_state.report_loaded and not st.session_state.get('auto_load_attempted'):
+    st.session_state.auto_load_attempted = True
+    with st.spinner("Loading Power BI Report..."):
+        embed_url, token = get_embed_params()
+        if embed_url and token:
+            st.session_state.embed_url = embed_url
+            st.session_state.embed_token = token
+            st.session_state.report_loaded = True
+        else:
+            # If loading failed, leave report_loaded False and show info in the main area
+            st.session_state.report_loaded = False
+            st.info("Unable to auto-load the report. Check workspace permissions or credentials.")
+
+# Show the embedded report if loaded
+if st.session_state.report_loaded and st.session_state.embed_token and st.session_state.embed_url:
+    render_powerbi_report(
+        st.session_state.embed_token,
+        st.session_state.embed_url,
+        st.session_state.current_airline_filter,
+        st.session_state.current_date_from,
+        st.session_state.current_date_to
+    )
 elif st.session_state.report_loaded:
     st.error("Failed to load report. Please try again.")
+else:
+    st.info("👆 Click **Load Report** to view the Power BI dashboard, then use the chat to filter by airline.")
