@@ -245,49 +245,146 @@ def render_powerbi_report(embed_token: str, embed_url: str, airline_filter: str 
     filter_js = f"""
         report.on('loaded', async function() {{
             try {{
-                const filters = [];
+                // Track which columns were handled by slicer visuals
+                let airlineSlicerFound = false;
+                let dateSlicerFound = false;
 
-                // Airline basic filter
-                if ("{af_val}") {{
-                    filters.push({{
+                // --- STEP 1: Apply filters via slicer visuals (preferred) ---
+                try {{
+                    const pages = await report.getPages();
+                    for (const p of pages) {{
+                        const visuals = await p.getVisuals();
+                        for (const v of visuals) {{
+                            if (v.type === 'slicer') {{
+                                try {{
+                                    const state = await v.getSlicerState();
+                                    const targets = state.targets || [];
+
+                                    for (const target of targets) {{
+                                        // --- Airline slicer ---
+                                        if (target.column === 'AIRLINE_NAME') {{
+                                            airlineSlicerFound = true;
+                                            try {{
+                                                if ("{af_val}" && "{af_val}" !== "") {{
+                                                    const airlineFilter = {{
+                                                        $schema: "http://powerbi.com/product/schema#basic",
+                                                        target: {{ table: target.table, column: target.column }},
+                                                        operator: "In",
+                                                        values: ["{af_val}"],
+                                                        filterType: models.FilterType.BasicFilter
+                                                    }};
+                                                    await v.setSlicerState({{ filters: [airlineFilter] }});
+                                                    console.log('Airline slicer synced:', '{af_val}');
+                                                }} else {{
+                                                    await v.setSlicerState({{ filters: [] }});
+                                                    console.log('Airline slicer cleared');
+                                                }}
+                                            }} catch (err) {{
+                                                console.warn('Airline slicer sync failed:', err);
+                                                airlineSlicerFound = false;
+                                            }}
+                                        }}
+
+                                        // --- Date range slicer ---
+                                        if (target.column === 'FLIGHT_DATE') {{
+                                            dateSlicerFound = true;
+                                            try {{
+                                                if ("{df_val}" || "{dt_val}") {{
+                                                    // Try multiple date value formats for compatibility
+                                                    let filterApplied = false;
+                                                    const formats = [
+                                                        // Format 1: ISO datetime strings (most compatible)
+                                                        () => {{
+                                                            const filter = {{
+                                                                $schema: "http://powerbi.com/product/schema#advanced",
+                                                                target: {{ table: target.table, column: target.column }},
+                                                                logicalOperator: "And",
+                                                                conditions: [],
+                                                                filterType: models.FilterType.AdvancedFilter
+                                                            }};
+                                                            if ("{df_val}") filter.conditions.push({{ operator: "GreaterThanOrEqual", value: "{df_val}T00:00:00" }});
+                                                            if ("{dt_val}") filter.conditions.push({{ operator: "LessThanOrEqual", value: "{dt_val}T23:59:59" }});
+                                                            return filter;
+                                                        }},
+                                                        // Format 2: Date objects
+                                                        () => {{
+                                                            const filter = {{
+                                                                $schema: "http://powerbi.com/product/schema#advanced",
+                                                                target: {{ table: target.table, column: target.column }},
+                                                                logicalOperator: "And",
+                                                                conditions: [],
+                                                                filterType: models.FilterType.AdvancedFilter
+                                                            }};
+                                                            if ("{df_val}") filter.conditions.push({{ operator: "GreaterThanOrEqual", value: new Date("{df_val}T00:00:00Z") }});
+                                                            if ("{dt_val}") filter.conditions.push({{ operator: "LessThanOrEqual", value: new Date("{dt_val}T23:59:59Z") }});
+                                                            return filter;
+                                                        }},
+                                                        // Format 3: Millisecond timestamps
+                                                        () => {{
+                                                            const filter = {{
+                                                                $schema: "http://powerbi.com/product/schema#advanced",
+                                                                target: {{ table: target.table, column: target.column }},
+                                                                logicalOperator: "And",
+                                                                conditions: [],
+                                                                filterType: models.FilterType.AdvancedFilter
+                                                            }};
+                                                            if ("{df_val}") filter.conditions.push({{ operator: "GreaterThanOrEqual", value: new Date("{df_val}T00:00:00Z").getTime() }});
+                                                            if ("{dt_val}") filter.conditions.push({{ operator: "LessThanOrEqual", value: new Date("{dt_val}T23:59:59Z").getTime() }});
+                                                            return filter;
+                                                        }}
+                                                    ];
+
+                                                    for (let i = 0; i < formats.length && !filterApplied; i++) {{
+                                                        try {{
+                                                            const dateFilter = formats[i]();
+                                                            console.log('Attempting date filter format', i + 1, ':', JSON.stringify(dateFilter, null, 2));
+                                                            await v.setSlicerState({{ filters: [dateFilter] }});
+                                                            console.log('✓ Date slicer synced with format', i + 1, ':', '{df_val}', 'to', '{dt_val}');
+                                                            filterApplied = true;
+                                                        }} catch (err) {{
+                                                            console.warn('Date filter format', i + 1, 'failed:', err.message);
+                                                        }}
+                                                    }}
+
+                                                    if (!filterApplied) {{
+                                                        console.error('All date filter formats failed');
+                                                        dateSlicerFound = false;
+                                                    }}
+                                                }} else {{
+                                                    await v.setSlicerState({{ filters: [] }});
+                                                    console.log('Date slicer cleared');
+                                                }}
+                                            }} catch (err) {{
+                                                console.error('Date slicer sync failed:', err);
+                                                dateSlicerFound = false;
+                                            }}
+                                        }}
+                                    }}
+                                }} catch (err) {{
+                                    console.warn('Could not read slicer state:', v.name || v.title, err);
+                                }}
+                            }}
+                        }}
+                    }}
+                }} catch (err) {{
+                    console.warn('Slicer discovery error:', err);
+                }}
+
+                // --- STEP 2: Fallback to report-level filters for columns without slicers ---
+                const reportFilters = [];
+
+                if (!airlineSlicerFound && "{af_val}" && "{af_val}" !== "") {{
+                    reportFilters.push({{
                         $schema: "http://powerbi.com/product/schema#basic",
                         target: {{ table: "gold_aviation_report", column: "AIRLINE_NAME" }},
                         operator: "In",
                         values: ["{af_val}"],
                         filterType: models.FilterType.BasicFilter
                     }});
+                    console.log('Airline filter applied at report level (no slicer found)');
                 }}
 
-                    // Try to synchronize slicer visuals so the slicer UI shows the selection
-                    try {{
-                        const pages = await report.getPages();
-                        for (const p of pages) {{
-                            const visuals = await p.getVisuals();
-                            for (const v of visuals) {{
-                                // Look for slicer visuals that likely target the airline column
-                                if (v.type === 'slicer') {{
-                                    const title = (v.title || '').toString().toLowerCase();
-                                    const name = (v.name || '').toString().toLowerCase();
-                                    if (title.includes('airline') || name.includes('airline')) {{
-                                        try {{
-                                            if ("{af_val}" && "{af_val}" !== "") {{
-                                                await v.setSlicerState({{ slicerState: {{ selectedValues: ["{af_val}"] }} }});
-                                                console.log('Slicer synced for', v.name || v.title, '{af_val}');
-                                            }} else {{
-                                                try {{ await v.setSlicerState({{ slicerState: {{ selectedValues: [] }} }}); }} catch (e) {{}}
-                                            }}
-                                        }} catch (err) {{
-                                            console.warn('Failed to set slicer state on visual', v.name || v.title, err);
-                                        }}
-                                    }}
-                                }}
-                            }}
-                        }}
-                    }} catch (err) {{
-                        console.warn('Slicer sync error:', err);
-                    }}
-                // Date advanced filter
-                if ("{df_val}" || "{dt_val}") {{
+                if (!dateSlicerFound && ("{df_val}" || "{dt_val}")) {{
                     const dateFilter = {{
                         $schema: "http://powerbi.com/product/schema#advanced",
                         target: {{ table: "gold_aviation_report", column: "FLIGHT_DATE" }},
@@ -296,19 +393,20 @@ def render_powerbi_report(embed_token: str, embed_url: str, airline_filter: str 
                         filterType: models.FilterType.AdvancedFilter
                     }};
                     if ("{df_val}") {{
-                        dateFilter.conditions.push({{ operator: "GreaterThanOrEqual", value: new Date("{df_val}T00:00:00.000Z") }});
+                        dateFilter.conditions.push({{ operator: "GreaterThanOrEqual", value: "{df_val}T00:00:00" }});
                     }}
                     if ("{dt_val}") {{
-                        dateFilter.conditions.push({{ operator: "LessThanOrEqual", value: new Date("{dt_val}T23:59:59.999Z") }});
+                        dateFilter.conditions.push({{ operator: "LessThanOrEqual", value: "{dt_val}T23:59:59" }});
                     }}
-                    filters.push(dateFilter);
+                    if (dateFilter.conditions.length > 0) {{
+                        reportFilters.push(dateFilter);
+                        console.log('Date filter applied at report level (no slicer found):', JSON.stringify(dateFilter));
+                    }}
                 }}
 
-                // Apply filters
-                if (filters.length > 0) {{
-                    await report.setFilters(filters);
-                    console.log('AI Filters applied:', filters);
-                }} else {{
+                if (reportFilters.length > 0) {{
+                    await report.setFilters(reportFilters);
+                }} else if (!"{af_val}" && !"{df_val}" && !"{dt_val}") {{
                     await report.removeFilters();
                     console.log('All filters cleared');
                 }}
