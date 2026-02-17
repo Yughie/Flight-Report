@@ -4,44 +4,55 @@ import streamlit.components.v1 as components
 from .config import TENANT_ID, CLIENT_ID, CLIENT_SECRET, WORKSPACE_ID, REPORT_ID
 
 
-def get_embed_params():
-    # 1. Get Azure AD Access Token
-    auth_url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
-    
+def get_aad_token() -> str:
+    """Acquire an Azure AD access token for the Power BI REST API.
+
+    This token is used server-side for embed-token generation **and**
+    for DAX ``executeQueries`` calls.
+    """
+    auth_url = (
+        f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
+    )
     auth_data = {
         "grant_type": "client_credentials",
         "client_id": CLIENT_ID,
-        "client_secret": CLIENT_SECRET, 
-        "scope": "https://analysis.windows.net/powerbi/api/.default"
+        "client_secret": CLIENT_SECRET,
+        "scope": "https://analysis.windows.net/powerbi/api/.default",
     }
-    
-    auth_res = requests.post(auth_url, data=auth_data)
-    
+    auth_res = requests.post(auth_url, data=auth_data, timeout=30)
     if auth_res.status_code != 200:
-        st.error(f"Azure Auth Failed ({auth_res.status_code})")
-        st.json(auth_res.json())
+        raise ConnectionError(
+            f"Azure AD auth failed ({auth_res.status_code}): {auth_res.text}"
+        )
+    return auth_res.json()["access_token"]
+
+
+def get_embed_params():
+    # 1. Get Azure AD Access Token
+    try:
+        aad_token = get_aad_token()
+    except ConnectionError as exc:
+        st.error(str(exc))
         st.stop()
-        
-    aad_token = auth_res.json().get("access_token")
 
     # 2. Get Report Details
     headers = {'Content-Type': 'application/json', 'Authorization': f'Bearer {aad_token}'}
     report_url = f"https://api.powerbi.com/v1.0/myorg/groups/{WORKSPACE_ID}/reports/{REPORT_ID}"
     
-    report_res = requests.get(report_url, headers=headers)
+    report_res = requests.get(report_url, headers=headers, timeout=30)
     
     if report_res.status_code != 200:
         st.error(f"Power BI API Failed ({report_res.status_code})")
         st.info("Check if your Service Principal (App) is a Member of the Power BI Workspace.")
         st.write("Full Error from Microsoft:", report_res.text)
-        return None, None
+        return None, None, None
 
     embed_data = report_res.json()
 
     # 3. Generate an embed token
     generate_url = f"https://api.powerbi.com/v1.0/myorg/groups/{WORKSPACE_ID}/reports/{REPORT_ID}/GenerateToken"
     generate_body = {"accessLevel": "View"}
-    generate_res = requests.post(generate_url, headers=headers, json=generate_body)
+    generate_res = requests.post(generate_url, headers=headers, json=generate_body, timeout=30)
 
     if generate_res.status_code != 200:
         st.error(f"Generate Embed Token Failed ({generate_res.status_code})")
@@ -49,10 +60,10 @@ def get_embed_params():
             st.json(generate_res.json())
         except Exception:
             st.write(generate_res.text)
-        return None, None
+        return None, None, None
 
     embed_token = generate_res.json().get("token")
-    return embed_data.get("embedUrl"), embed_token
+    return embed_data.get("embedUrl"), embed_token, embed_data.get("datasetId")
 
 
 def render_powerbi_report(embed_token: str, embed_url: str, airline_filter: str = None, date_from: str = None, date_to: str = None):
@@ -237,4 +248,4 @@ def render_powerbi_report(embed_token: str, embed_url: str, airline_filter: str 
     """
     components.html(pbi_html, height=650)
 
-__all__ = ["get_embed_params", "render_powerbi_report"]
+__all__ = ["get_aad_token", "get_embed_params", "render_powerbi_report"]

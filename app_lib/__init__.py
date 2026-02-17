@@ -1,3 +1,3 @@
 """App library package for modularized app code."""
 
-__all__ = ["config", "ai", "powerbi"]
+__all__ = ["config", "ai", "powerbi", "powerbi_data"]
