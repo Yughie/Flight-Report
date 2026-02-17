@@ -23,3 +23,7 @@ node_modules/
 Dataset/
 
 *.pbix
+# Explicit large files to ignore
+Dataset/flights.csv
+Flight Report.pbix
+Flight Report Databricks.pbix
