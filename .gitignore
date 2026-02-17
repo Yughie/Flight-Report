@@ -21,3 +21,5 @@ venv/
 # Node
 node_modules/
 Dataset/
+
+*.pbix
