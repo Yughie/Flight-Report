@@ -55,7 +55,7 @@ def append_kpi_context(context: str, extracted_result: dict) -> str:
 
         # Default goal thresholds (can be adjusted later)
         GOALS = {
-            'on_time_rate': 0.70,       # 70% on-time target
+            'on_time_rate': 0.80,       # 80% on-time target
             'cancellation_rate': 0.02   # 2% cancellation target
         }
 
