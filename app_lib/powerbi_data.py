@@ -87,18 +87,27 @@ def execute_dax(aad_token: str, dataset_id: str, dax: str) -> list:
 
     try:
         rows = data["results"][0]["tables"][0]["rows"]
-        
-        # Power BI returns column names with square brackets like [ColumnName]
-        # Strip the brackets to match what we expect
+
+        # Power BI returns column keys in the format  table[Column Name]
+        # e.g. "gold_aviation_report[CANCELLATION REASON]"
+        # Extract only the part inside the last pair of brackets so all
+        # consumers can use the bare column name as the dict key.
+        def _clean_key(k: str) -> str:
+            # Try to extract the content inside the last [...] pair
+            lb = k.rfind("[")
+            rb = k.rfind("]")
+            if lb != -1 and rb != -1 and rb > lb:
+                return k[lb + 1 : rb]
+            # Fallback: strip leading/trailing brackets (simple column names)
+            return k.strip("[]")
+
         cleaned_rows = []
         for row in rows:
             cleaned_row = {}
             for key, value in row.items():
-                # Remove square brackets from key names
-                clean_key = key.strip("[]")
-                cleaned_row[clean_key] = value
+                cleaned_row[_clean_key(key)] = value
             cleaned_rows.append(cleaned_row)
-        
+
         return cleaned_rows
     except (KeyError, IndexError) as e:
         # Log what we got back to help debug
@@ -206,17 +215,64 @@ def fetch_date_range(
     token: str, ds_id: str,
     airline=None, date_from=None, date_to=None,
 ) -> dict:
-    """Min / max flight date + totals for the active filter."""
-    define, refs = _build_defines(airline, date_from, date_to)
+    """Min / max flight date + totals for the active filter.
+
+    Also returns last-day stats:
+        LastFlightDate, LastDayFlights, LastDayCancelled,
+        LastDayCancellationRate, LastDayOTP
+    """
+    # Build the standard date/airline filter VARs via _build_defines,
+    # then append a __LastDate VAR so we can cheaply reference it without
+    # nesting CALCULATE(MAX(...)) inside a filter predicate (which causes
+    # DAX 400 errors in ROW() context).
+    _, refs = _build_defines(airline, date_from, date_to)
     calc_args = (", " + ", ".join(refs)) if refs else ""
+
+    # Collect all VAR lines manually so __LastDate can depend on the others
+    var_parts: list[str] = []
+
+    if date_from or date_to:
+        cond = _date_condition(date_from, date_to)
+        var_parts.append(
+            "    VAR __DateFilter =\n"
+            "        FILTER(\n"
+            "            KEEPFILTERS(VALUES('gold_aviation_report'[FLIGHT_DATE])),\n"
+            f"            {cond}\n"
+            "        )"
+        )
+
+    if airline:
+        escaped = airline.replace("'", "''")
+        var_parts.append(
+            "    VAR __AirlineFilter =\n"
+            f'        TREATAS({{"{escaped}"}}, '
+            "'gold_aviation_report'[AIRLINE_NAME])"
+        )
+
+    # __LastDate captures the most-recent date respecting active filters
+    var_parts.append(
+        f"    VAR __LastDate = CALCULATE(MAX('gold_aviation_report'[FLIGHT_DATE]){calc_args})"
+    )
+
+    define_block = "DEFINE\n" + "\n\n".join(var_parts) + "\n\n"
+
     query = (
-        f"{define}"
+        f"{define_block}"
         "EVALUATE\n"
         "    ROW(\n"
         f'        "MinFLIGHT_DATE", CALCULATE(MIN(\'gold_aviation_report\'[FLIGHT_DATE]){calc_args}),\n'
         f'        "MaxFLIGHT_DATE", CALCULATE(MAX(\'gold_aviation_report\'[FLIGHT_DATE]){calc_args}),\n'
         f'        "TotalFlights", CALCULATE(COUNTROWS(\'gold_aviation_report\'){calc_args}),\n'
-        f'        "TotalCancelled", CALCULATE(SUM(\'gold_aviation_report\'[CANCELLED]){calc_args})\n'
+        f'        "TotalCancelled", CALCULATE(SUM(\'gold_aviation_report\'[CANCELLED]){calc_args}),\n'
+        f'        "LastFlightDate", __LastDate,\n'
+        f'        "LastDayFlights", CALCULATE(COUNTROWS(\'gold_aviation_report\'), \'gold_aviation_report\'[FLIGHT_DATE] = __LastDate{calc_args}),\n'
+        f'        "LastDayCancelled", CALCULATE(SUM(\'gold_aviation_report\'[CANCELLED]), \'gold_aviation_report\'[FLIGHT_DATE] = __LastDate{calc_args}),\n'
+        f'        "LastDayCancellationRate", DIVIDE(\n'
+        f'            CALCULATE(SUM(\'gold_aviation_report\'[CANCELLED]), \'gold_aviation_report\'[FLIGHT_DATE] = __LastDate{calc_args}),\n'
+        f'            CALCULATE(COUNTROWS(\'gold_aviation_report\'), \'gold_aviation_report\'[FLIGHT_DATE] = __LastDate{calc_args}), 0),\n'
+        f'        "LastDayOTP", DIVIDE(\n'
+        f'            CALCULATE(COUNTROWS(\'gold_aviation_report\'), \'gold_aviation_report\'[FLIGHT_DATE] = __LastDate, \'gold_aviation_report\'[ARRIVAL_DELAY] <= 15{calc_args}),\n'
+        f'            CALCULATE(COUNTROWS(\'gold_aviation_report\'), \'gold_aviation_report\'[FLIGHT_DATE] = __LastDate{calc_args}), 0)\n'
         "    )\n"
     )
     rows = execute_dax(token, ds_id, query)
@@ -228,24 +284,34 @@ def fetch_delay_summary(
     airline=None, date_from=None, date_to=None,
 ) -> dict:
     """Sum of each delay-type column."""
+    # Use DEFINE + CALCULATE(<expr>, <filter refs>) to ensure the
+    # same dynamic date/airline filters are applied consistently to
+    # each numerator/denominator. Returns a single-row dict of sums.
     define, refs = _build_defines(airline, date_from, date_to)
-    sc_filter = ("        " + ",\n        ".join(refs) + ",\n") if refs else ""
+    calc_args = (", " + ", ".join(refs)) if refs else ""
     query = (
         f"{define}"
         "EVALUATE\n"
-        "    SUMMARIZECOLUMNS(\n"
-        f"{sc_filter}"
-        '        "SumDEPARTURE_DELAY", IGNORE(CALCULATE(SUM(\'gold_aviation_report\'[DEPARTURE_DELAY]))),\n'
-        '        "SumLATE_AIRCRAFT_DELAY", IGNORE(CALCULATE(SUM(\'gold_aviation_report\'[LATE_AIRCRAFT_DELAY]))),\n'
-        '        "SumAIRLINE_DELAY", IGNORE(CALCULATE(SUM(\'gold_aviation_report\'[AIRLINE_DELAY]))),\n'
-        '        "SumARRIVAL_DELAY", IGNORE(CALCULATE(SUM(\'gold_aviation_report\'[ARRIVAL_DELAY]))),\n'
-        '        "SumSECURITY_DELAY", IGNORE(CALCULATE(SUM(\'gold_aviation_report\'[SECURITY_DELAY]))),\n'
-        '        "SumWEATHER_DELAY", IGNORE(CALCULATE(SUM(\'gold_aviation_report\'[WEATHER_DELAY]))),\n'
-        '        "SumAIR_SYSTEM_DELAY", IGNORE(CALCULATE(SUM(\'gold_aviation_report\'[AIR_SYSTEM_DELAY])))\n'
+        "    ROW(\n"
+        f'        "SumDEPARTURE_DELAY", CALCULATE(SUM(\'gold_aviation_report\'[DEPARTURE_DELAY]){calc_args}),\n'
+        f'        "SumLATE_AIRCRAFT_DELAY", CALCULATE(SUM(\'gold_aviation_report\'[LATE_AIRCRAFT_DELAY]){calc_args}),\n'
+        f'        "SumAIRLINE_DELAY", CALCULATE(SUM(\'gold_aviation_report\'[AIRLINE_DELAY]){calc_args}),\n'
+        f'        "SumARRIVAL_DELAY", CALCULATE(SUM(\'gold_aviation_report\'[ARRIVAL_DELAY]){calc_args}),\n'
+        f'        "SumSECURITY_DELAY", CALCULATE(SUM(\'gold_aviation_report\'[SECURITY_DELAY]){calc_args}),\n'
+        f'        "SumWEATHER_DELAY", CALCULATE(SUM(\'gold_aviation_report\'[WEATHER_DELAY]){calc_args}),\n'
+        f'        "SumAIR_SYSTEM_DELAY", CALCULATE(SUM(\'gold_aviation_report\'[AIR_SYSTEM_DELAY]){calc_args})\n'
         "    )\n"
     )
     rows = execute_dax(token, ds_id, query)
     return rows[0] if rows else {}
+
+
+_CANCEL_CODE_LABELS = {
+    "A": "Airline/Carrier",
+    "B": "Weather",
+    "C": "National Air System",
+    "D": "Security",
+}
 
 
 def fetch_cancellation_breakdown(
@@ -254,39 +320,24 @@ def fetch_cancellation_breakdown(
 ) -> list:
     """Cancellation count per reason.
 
-    Mirrors the report's cancellation-reason visual which applies:
-    1. A TREATAS filter on 'flights'[CANCELLATION_REASON] (the raw codes)
-    2. A TREATAS filter on 'gold_aviation_report'[CANCELLATION REASON] (the labels)
-    3. Date & airline filters from the slicers
+    Queries the raw 'flights'[CANCELLATION_REASON] codes (A/B/C/D)
+    directly from the flights table and sums 'flights'[CANCELLED].
+    Date and airline filters are applied via the gold_aviation_report
+    table using TREATAS so the model relationships are respected.
+    Labels are mapped to readable names in Python after the query.
     """
     var_parts: list[str] = []
     sc_refs: list[str] = []
 
-    # Filter table from the 'flights' table (raw cancellation codes)
+    # Only include the four real cancellation codes — exclude "Not Cancelled" / blanks
     var_parts.append(
-        "    VAR __CancelCodesFilter =\n"
-        "        TREATAS(\n"
-        '            {"A: Carrier (Airline)",\n'
-        '                "B: Weather",\n'
-        '                "C: National Air System (NAS)",\n'
-        '                "D: Security"},\n'
-        "            'flights'[CANCELLATION_REASON]\n"
-        "        )"
+        '    VAR __CancelCodesFilter =\n'
+        '        FILTER(\n'
+        '            KEEPFILTERS(VALUES(\'flights\'[CANCELLATION_REASON])),\n'
+        '            \'flights\'[CANCELLATION_REASON] IN {"A", "B", "C", "D"}\n'
+        '        )'
     )
     sc_refs.append("__CancelCodesFilter")
-
-    # Filter table on the gold table (readable labels)
-    var_parts.append(
-        "    VAR __CancelLabelFilter =\n"
-        "        TREATAS(\n"
-        '            {"Airline/Carrier",\n'
-        '                "National Air System",\n'
-        '                "Security",\n'
-        '                "Weather"},\n'
-        "            'gold_aviation_report'[CANCELLATION REASON]\n"
-        "        )"
-    )
-    sc_refs.append("__CancelLabelFilter")
 
     if date_from or date_to:
         cond = _date_condition(date_from, date_to)
@@ -313,22 +364,34 @@ def fetch_cancellation_breakdown(
     var_parts.append(
         "    VAR __Core =\n"
         "        SUMMARIZECOLUMNS(\n"
-        "            'gold_aviation_report'[CANCELLATION REASON],\n"
+        "            'flights'[CANCELLATION_REASON],\n"
         f"            {sc_filter_str},\n"
-        '            "SumCANCELLED", CALCULATE(SUM(\'gold_aviation_report\'[CANCELLED]))\n'
+        '            "SumCANCELLED", SUM(\'flights\'[CANCELLED])\n'
         "        )\n"
         "\n"
         "    VAR __Limited =\n"
-        "        TOPN(1002, __Core, [SumCANCELLED], 0, 'gold_aviation_report'[CANCELLATION REASON], 1)"
+        "        TOPN(1002, __Core, [SumCANCELLED], 0, 'flights'[CANCELLATION_REASON], 1)"
     )
 
     define = "DEFINE\n" + "\n\n".join(var_parts) + "\n\n"
     query = (
         f"{define}"
         "EVALUATE __Limited\n"
-        "ORDER BY [SumCANCELLED] DESC, 'gold_aviation_report'[CANCELLATION REASON]\n"
+        "ORDER BY [SumCANCELLED] DESC, 'flights'[CANCELLATION_REASON]\n"
     )
-    return execute_dax(token, ds_id, query)
+    raw_rows = execute_dax(token, ds_id, query)
+
+    # Map raw letter codes to readable labels so downstream consumers
+    # can use row["CANCELLATION REASON"] as before.
+    result = []
+    for row in raw_rows:
+        code = row.get("CANCELLATION_REASON") or ""
+        label = _CANCEL_CODE_LABELS.get(code.upper(), code or "Unknown")
+        result.append({
+            "CANCELLATION REASON": label,
+            "SumCANCELLED": row.get("SumCANCELLED", 0) or 0,
+        })
+    return result
 
 
 def _fetch_trend(
@@ -398,20 +461,34 @@ def fetch_flight_volume(token, ds_id, airline=None, date_from=None, date_to=None
 
 def fetch_otp(token, ds_id, airline=None, date_from=None, date_to=None):
     """On-time performance % vs target, per day."""
+    # Inline the on-time performance calculation to ensure the query
+    # remains compatible with dynamic DEFINE filters (date / airline).
+    measures_block = (
+        '"On_Time_Performance", DIVIDE('
+        "CALCULATE(COUNTROWS('gold_aviation_report'), 'gold_aviation_report'[ARRIVAL_DELAY] <= 15), "
+        "CALCULATE(COUNTROWS('gold_aviation_report')), 0),\n"
+        "            \"Target_OTP\", 'Key Measures'[Target OTP]"
+    )
     return _fetch_trend(
         token, ds_id,
-        "\"On_Time_Performance\", 'Key Measures'[On-Time Performance %],\n"
-        "            \"Target_OTP\", 'Key Measures'[Target OTP]",
+        measures_block,
         airline, date_from, date_to,
     )
 
 
 def fetch_cancellation_rate(token, ds_id, airline=None, date_from=None, date_to=None):
     """Cancellation rate vs target, per day."""
+    # Inline the cancellation-rate calculation so DEFINE filters (date/airline)
+    # properly apply to both numerator and denominator.
+    measures_block = (
+        '"Cancellation_Rate", DIVIDE('
+        "CALCULATE(SUM('gold_aviation_report'[CANCELLED])), "
+        "CALCULATE(COUNTROWS('gold_aviation_report')), 0),\n"
+        "            \"Target_Cancellation\", 'Key Measures'[Target cancellation]"
+    )
     return _fetch_trend(
         token, ds_id,
-        "\"Cancellation_Rate\", 'Key Measures'[Cancellation Rate],\n"
-        "            \"Target_Cancellation\", 'Key Measures'[Target cancellation]",
+        measures_block,
         airline, date_from, date_to,
     )
 
@@ -701,10 +778,7 @@ def _build_sop_recommendations(
         if cb:
             total_cancel_sum = sum(r.get("SumCANCELLED", 0) or 0 for r in cb)
             for row in cb:
-                reason = (
-                    row.get("CANCELLATION REASON") or
-                    row.get("gold_aviation_report[CANCELLATION REASON]") or "Unknown"
-                )
+                reason = row.get("CANCELLATION REASON") or "Unknown"
                 count = row.get("SumCANCELLED", 0) or 0
                 share = (count / total_cancel_sum * 100) if total_cancel_sum > 0 else 0
                 reason_lower = reason.lower()
@@ -916,6 +990,21 @@ def format_data_for_ai(
             c_status, c_desc = _assess_cancellation(cancel_rate)
             lines.append(f"Overall Cancellation Rate: {cancel_rate:.2%}  {_health_badge(c_status)}")
             lines.append(f"  Assessment: {c_desc}")
+
+        # Last-day cancellation rate + OTP
+        last_date = dr.get("LastFlightDate")
+        last_day_flights = dr.get("LastDayFlights") or 0
+        last_day_cancelled = dr.get("LastDayCancelled") or 0
+        last_day_cr = dr.get("LastDayCancellationRate")
+        last_day_otp = dr.get("LastDayOTP")
+        if last_date:
+            lines.append(f"Last Day ({last_date}): {_fmt(last_day_flights)} flights, {_fmt(last_day_cancelled)} cancelled")
+            if last_day_cr is not None:
+                ld_cr_status, ld_cr_desc = _assess_cancellation(last_day_cr)
+                lines.append(f"  Cancellation Rate: {last_day_cr:.2%}  {_health_badge(ld_cr_status)}  — {ld_cr_desc}")
+            if last_day_otp is not None:
+                ld_otp_status, ld_otp_desc = _assess_otp(last_day_otp)
+                lines.append(f"  On-Time Performance: {last_day_otp:.1%}  {_health_badge(ld_otp_status)}  — {ld_otp_desc}")
         lines.append("")
 
     # ── Delay summary with per-flight averages ────────────────────
@@ -931,40 +1020,65 @@ def format_data_for_ai(
             ("Air System Delay", "SumAIR_SYSTEM_DELAY"),
             ("Security Delay", "SumSECURITY_DELAY"),
         ]
-        # Compute total controllable delay (exclude departure/arrival which are aggregate outcomes)
+        # Root-cause delay keys (the 5 causes that explain WHY delays happen)
         controllable_keys = [
             "SumLATE_AIRCRAFT_DELAY", "SumAIRLINE_DELAY",
             "SumWEATHER_DELAY", "SumAIR_SYSTEM_DELAY", "SumSECURITY_DELAY",
         ]
-        total_controllable = sum(ds.get(k, 0) or 0 for k in controllable_keys)
+        # Total of root-cause delays only (for root-cause % among causes)
+        total_root_cause = sum(ds.get(k, 0) or 0 for k in controllable_keys)
 
-        lines.append(f"  {'Delay Type':<25} {'Total (min)':>14} {'Avg/Flight':>12} {'Share':>8}")
-        lines.append(f"  {'─' * 25} {'─' * 14} {'─' * 12} {'─' * 8}")
+        lines.append(f"  {'Delay Type':<25} {'Total (min)':>14} {'Avg/Flight':>12} {'% of Dep':>10} {'% of Causes':>13}")
+        lines.append(f"  {'─' * 25} {'─' * 14} {'─' * 12} {'─' * 10} {'─' * 13}")
+
+        total_dep_delay = ds.get("SumDEPARTURE_DELAY", 0) or 0
+        total_arr_delay = ds.get("SumARRIVAL_DELAY", 0) or 0
+
         for label, key in delay_items:
             val = ds.get(key, 0) or 0
             avg_per_flight = (val / total_flights) if total_flights > 0 else 0
-            is_controllable = key in controllable_keys
-            share = (val / total_controllable * 100) if (is_controllable and total_controllable > 0) else None
-            share_str = f"{share:.1f}%" if share is not None else "—"
-            lines.append(f"  {label:<25} {_fmt(val):>14} {avg_per_flight:>10.1f}m {share_str:>8}")
+            # % of Departure Delay (how much of departure delay does this type represent)
+            pct_of_dep = (val / total_dep_delay * 100) if total_dep_delay > 0 else None
+            # % of Root Causes (share among the 5 root-cause delay types only)
+            is_root_cause = key in controllable_keys
+            pct_of_causes = (val / total_root_cause * 100) if (is_root_cause and total_root_cause > 0) else None
+
+            pct_dep_str = f"{pct_of_dep:.1f}%" if pct_of_dep is not None else "   —"
+            pct_cause_str = f"{pct_of_causes:.1f}%" if pct_of_causes is not None else "      —"
+            lines.append(f"  {label:<25} {_fmt(val):>14} {avg_per_flight:>10.1f}m {pct_dep_str:>10} {pct_cause_str:>13}")
 
         if total_flights > 0:
-            total_dep_delay = ds.get("SumDEPARTURE_DELAY", 0) or 0
-            total_arr_delay = ds.get("SumARRIVAL_DELAY", 0) or 0
             lines.append("")
             lines.append(f"  Average Departure Delay per Flight: {total_dep_delay / total_flights:.1f} minutes")
             lines.append(f"  Average Arrival Delay per Flight: {total_arr_delay / total_flights:.1f} minutes")
 
-        # Identify top 2 controllable delay drivers
-        ranked_ctrl = sorted(
-            [(k, ds.get(k, 0) or 0) for k in controllable_keys],
-            key=lambda x: x[1], reverse=True,
+        # Root-cause breakdown ranked by share
+        ranked_causes = sorted(
+            [(key, label, ds.get(key, 0) or 0) for label, key in delay_items if key in controllable_keys],
+            key=lambda x: x[2], reverse=True,
         )
-        top_drivers = [(k.replace("Sum", "").replace("_", " ").title(), v) for k, v in ranked_ctrl[:2] if v > 0]
-        if top_drivers:
-            lines.append(f"  🔑 Top delay drivers: {top_drivers[0][0]} ({_fmt(top_drivers[0][1])} min)")
-            if len(top_drivers) > 1:
-                lines.append(f"                       {top_drivers[1][0]} ({_fmt(top_drivers[1][1])} min)")
+        lines.append("")
+        lines.append("  ── Outcome Metrics (aggregate delay experienced) ──")
+        for out_label, out_key in [("Departure Delay", "SumDEPARTURE_DELAY"), ("Arrival Delay", "SumARRIVAL_DELAY")]:
+            val = ds.get(out_key, 0) or 0
+            avg = (val / total_flights) if total_flights > 0 else 0
+            lines.append(f"  {out_label:<25} {_fmt(val):>12} min  avg {avg:.1f}m/flight  [OUTCOME — not a cause]")
+
+        lines.append("")
+        lines.append("  ── Root-Cause Delay Breakdown (% share among 5 delay causes) ──")
+        for key, label, minutes in ranked_causes:
+            pct = (minutes / total_root_cause * 100) if total_root_cause > 0 else 0
+            pct_of_dep = (minutes / total_dep_delay * 100) if total_dep_delay > 0 else 0
+            avg = (minutes / total_flights) if total_flights > 0 else 0
+            bar = "█" * int(pct / 5)  # rough bar, 1 block per 5%
+            lines.append(f"  {label:<25} {pct:>5.1f}% of causes  {pct_of_dep:>5.1f}% of dep  {_fmt(minutes):>12} min  avg {avg:.1f}m/flight  {bar}")
+
+        if ranked_causes:
+            top_cause_label = ranked_causes[0][1]
+            top_cause_pct = (ranked_causes[0][2] / total_root_cause * 100) if total_root_cause > 0 else 0
+            lines.append(f"  🔑 #1 Root Cause: {top_cause_label} ({top_cause_pct:.1f}% of all cause delay minutes)")
+            if len(ranked_causes) > 1:
+                lines.append(f"  🔑 #2 Root Cause: {ranked_causes[1][1]} ({(ranked_causes[1][2] / total_root_cause * 100) if total_root_cause > 0 else 0:.1f}%)")
         lines.append("")
 
     # ── Cancellation breakdown with computed shares ───────────────
@@ -973,21 +1087,13 @@ def format_data_for_ai(
         lines.append("━━━ CANCELLATIONS BY REASON ━━━")
         total_cancel_sum = sum(r.get("SumCANCELLED", 0) or 0 for r in cb)
         for row in cb:
-            reason = (
-                row.get("CANCELLATION REASON") or
-                row.get("gold_aviation_report[CANCELLATION REASON]") or
-                row.get("[gold_aviation_report[CANCELLATION REASON]]") or
-                "Unknown"
-            )
+            reason = row.get("CANCELLATION REASON") or "Unknown"
             count = row.get("SumCANCELLED", 0) or 0
             share = (count / total_cancel_sum * 100) if total_cancel_sum > 0 else 0
             lines.append(f"  {reason}: {_fmt(count)} flights ({share:.1f}%)")
         if total_cancel_sum > 0:
             dominant = max(cb, key=lambda r: r.get("SumCANCELLED", 0) or 0)
-            dom_reason = (
-                dominant.get("CANCELLATION REASON") or
-                dominant.get("gold_aviation_report[CANCELLATION REASON]") or "Unknown"
-            )
+            dom_reason = dominant.get("CANCELLATION REASON") or "Unknown"
             dom_count = dominant.get("SumCANCELLED", 0) or 0
             dom_share = dom_count / total_cancel_sum * 100
             lines.append(f"  🔑 Leading cancellation reason: {dom_reason} ({dom_share:.1f}%)")

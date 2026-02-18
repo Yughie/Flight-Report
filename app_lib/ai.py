@@ -1,5 +1,199 @@
-from promptAI import llm
+"""AI classification & insight analysis layer.
+
+Uses LangChain prompt templates, structured output, and LCEL chains
+for robust intent classification and streaming insight generation.
+"""
+
+from __future__ import annotations
+
+import time
+import re
+import datetime as _dt
+from typing import Optional
+from difflib import get_close_matches
+
+from langchain_core.messages import (
+    HumanMessage,
+    SystemMessage,
+    AIMessage,
+    BaseMessage,
+)
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.output_parsers import StrOutputParser
+from pydantic import BaseModel, Field
+
+from promptAI import llm, llm_fast
 from .config import VALID_AIRLINES, DATA_MIN_DATE, DATA_MAX_DATE
+
+
+# ── Pre-computed lookup tables (built once, reused every call) ────
+_AIRLINE_LOWER_MAP: dict[str, str] = {a.lower(): a for a in VALID_AIRLINES}
+_AIRLINE_SHORTCUTS: dict[str, str] = {}
+for _a in VALID_AIRLINES:
+    # "Delta Air Lines Inc." → shortcuts: "delta", "delta air lines"
+    _words = _a.lower().replace(".", "").split()
+    _AIRLINE_SHORTCUTS[_words[0]] = _a                        # first word
+    _AIRLINE_SHORTCUTS[" ".join(_words[:-1])] = _a            # without "Inc."/"Co."
+    _AIRLINE_SHORTCUTS[" ".join(_words)] = _a                 # full lowercase
+    if len(_words) >= 2:
+        _AIRLINE_SHORTCUTS[" ".join(_words[:2])] = _a         # first two words
+
+_MIN_DATE = _dt.date.fromisoformat(DATA_MIN_DATE)
+_MAX_DATE = _dt.date.fromisoformat(DATA_MAX_DATE)
+
+
+# ── Shared helpers ────────────────────────────────────────────────
+
+
+def _fuzzy_match_airline(name: str) -> str | None:
+    """Fast fuzzy airline matching using pre-built lookup + difflib."""
+    if not name:
+        return None
+    low = name.lower().strip().rstrip(".")
+    # Exact match
+    if low in _AIRLINE_LOWER_MAP:
+        return _AIRLINE_LOWER_MAP[low]
+    # Shortcut match
+    if low in _AIRLINE_SHORTCUTS:
+        return _AIRLINE_SHORTCUTS[low]
+    # Substring containment (both directions)
+    for key, val in _AIRLINE_SHORTCUTS.items():
+        if low in key or key in low:
+            return val
+    # difflib close match on full names
+    matches = get_close_matches(low, list(_AIRLINE_LOWER_MAP.keys()), n=1, cutoff=0.5)
+    if matches:
+        return _AIRLINE_LOWER_MAP[matches[0]]
+    return None
+
+
+def _normalize_date(s: str) -> str | None:
+    """Parse a date string and clamp to dataset bounds. Returns ISO or None."""
+    if not s:
+        return None
+    s = s.strip()
+    if not s:
+        return None
+    # Already ISO
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
+        try:
+            d = _dt.date.fromisoformat(s)
+            return max(_MIN_DATE, min(_MAX_DATE, d)).isoformat()
+        except ValueError:
+            return None
+    # Try dateutil
+    try:
+        from dateutil import parser as _dp
+        d = _dp.parse(s).date()
+        return max(_MIN_DATE, min(_MAX_DATE, d)).isoformat()
+    except Exception:
+        pass
+    # Fallback regex
+    m = re.search(r"(\d{4}-\d{2}-\d{2})", s)
+    if m:
+        try:
+            d = _dt.date.fromisoformat(m.group(1))
+            return max(_MIN_DATE, min(_MAX_DATE, d)).isoformat()
+        except ValueError:
+            pass
+    return None
+
+
+def _to_langchain_messages(history: list[dict]) -> list[BaseMessage]:
+    """Convert dict-based chat history to LangChain message objects."""
+    messages: list[BaseMessage] = []
+    for msg in history:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        if role == "user":
+            messages.append(HumanMessage(content=content))
+        elif role == "assistant":
+            messages.append(AIMessage(content=content))
+        elif role == "system":
+            messages.append(SystemMessage(content=content))
+    return messages
+
+
+# ══════════════════════════════════════════════════════════════════
+#  INTENT CLASSIFICATION — Structured Output via LangChain
+# ══════════════════════════════════════════════════════════════════
+
+
+class IntentClassification(BaseModel):
+    """Structured output from the intent classifier.
+
+    LangChain's ``with_structured_output`` converts this into a tool-call
+    schema so the LLM returns validated JSON instead of free-form text.
+    """
+
+    action: str = Field(
+        description="One of: filter, clear, insight, none"
+    )
+    airline: Optional[str] = Field(
+        default=None,
+        description=(
+            "Full airline name if user mentions or implies one "
+            "(e.g. 'Delta Air Lines Inc.')"
+        ),
+    )
+    date_from: Optional[str] = Field(
+        default=None,
+        description="Start date in YYYY-MM-DD format if mentioned/implied",
+    )
+    date_to: Optional[str] = Field(
+        default=None,
+        description="End date in YYYY-MM-DD format if mentioned/implied",
+    )
+    message: Optional[str] = Field(
+        default=None,
+        description="Short response text — only for action=none (greetings, off-topic)",
+    )
+
+
+_CLASSIFY_SYSTEM_TEMPLATE = """\
+You classify user messages for a Power BI flight report (2015 data only).
+
+Current filters → Airline: {current_airline} | Dates: {current_dates}
+Available airlines: {airlines_list}
+
+Classification rules:
+• filter — user ONLY wants to change the view (airline, dates), no analysis needed.
+• clear — user wants to reset/remove all filters.
+• insight — user asks about data, performance, trends, analysis, comparisons.
+  ALSO include airline/date_from/date_to if the question implies a specific airline or
+  time range — the system will auto-filter AND generate analysis in one step.
+  Follow-ups ("tell me more", "why?", "elaborate") → insight with no filter change.
+  When in doubt between filter and insight → choose insight.
+• none — greetings, off-topic, non-flight-related chat. Provide a friendly message.
+
+Date rules:
+• Fuzzy-match airline names (e.g. "Delta" → "Delta Air Lines Inc.").
+• "until/by [date]" → date_to only; "from/after [date]" → date_from only.
+• All dates must be within 2015 (YYYY-MM-DD format).
+
+Examples:
+• "show me delta" → action=filter, airline=Delta Air Lines Inc.
+• "how is delta doing?" → action=insight, airline=Delta Air Lines Inc.
+• "what's the cancellation rate?" → action=insight
+• "delays in march" → action=insight, date_from=2015-03-01, date_to=2015-03-31
+• "flights in march" → action=filter, date_from=2015-03-01, date_to=2015-03-31
+• "tell me more" → action=insight
+• "reset everything" → action=clear
+• "hi" → action=none, message=Hello! Ask about flight data or set filters.
+• "compare airlines" → action=insight"""
+
+_classify_prompt = ChatPromptTemplate.from_messages([
+    ("system", _CLASSIFY_SYSTEM_TEMPLATE),
+    MessagesPlaceholder("chat_history", optional=True),
+    MessagesPlaceholder("insight_hint", optional=True),
+    ("human", "{user_message}"),
+])
+
+# LCEL chain: prompt → LLM with structured output → IntentClassification
+_classify_chain = _classify_prompt | llm_fast.with_structured_output(
+    IntentClassification
+)
+
 
 def extract_airline_filter(
     user_message: str,
@@ -9,211 +203,90 @@ def extract_airline_filter(
     current_date_to: str | None = None,
     insight_history: list | None = None,
 ) -> dict:
+    """Classify user intent and extract filter parameters.
+
+    Uses LangChain structured output (tool calling) for reliable parsing.
+    Returns dict with 'action', 'airline', 'date_from', 'date_to',
+    'message', and 'elapsed_ms' — fully compatible with existing callers.
     """
-    Use LLM to classify user intent and extract filter parameters.
-    Returns dict with 'action' (filter/clear/insight/none), 'airline', dates, etc.
-    """
-    airlines_list = "\n".join(f"- {a}" for a in VALID_AIRLINES)
+    t0 = time.perf_counter()
 
-    # Build a human-readable summary of what the viewer is currently seeing
-    _filters_desc_parts: list[str] = []
-    if current_airline:
-        _filters_desc_parts.append(f"Airline: {current_airline}")
-    else:
-        _filters_desc_parts.append("Airline: All airlines (no filter)")
-    if current_date_from or current_date_to:
-        _filters_desc_parts.append(
-            f"Date range: {current_date_from or DATA_MIN_DATE} to {current_date_to or DATA_MAX_DATE}"
-        )
-    else:
-        _filters_desc_parts.append(f"Date range: {DATA_MIN_DATE} to {DATA_MAX_DATE} (full year)")
-    current_filters_text = "\n".join(_filters_desc_parts)
-
-    system_prompt = f"""You are an AI assistant that helps control a Power BI flight report.
-Your job is to classify the user's intent and extract parameters.
-
-Important: The dataset only contains flights in the 2015 timeline. All dates must be within 2015.
-
-The viewer is CURRENTLY looking at the report with these active filters:
-{current_filters_text}
-
-Available airlines:
-{airlines_list}
-
-Instructions — respond with EXACTLY one of the following action types:
-
-1. FILTER — the user wants to change the airline or date filter:
-    ACTION: filter
-    AIRLINE: [exact airline name from the list]  ← include only if changing airline
-    DATE_FROM: YYYY-MM-DD  ← include only if changing start date
-    DATE_TO: YYYY-MM-DD    ← include only if changing end date
-    If the user asks to filter by date but does not provide specific dates, set DATE_FROM to 2015-01-01 and DATE_TO to 2015-12-31.
-
-2. Single-date shorthand:
-   - Phrases like "go to [date]", "until [date]", "by [date]" → DATE_TO only
-   - Phrases like "start from [date]", "begin [date]", "after [date]" → DATE_FROM only
-   - If unclear, default to DATE_TO for single dates
-
-3. CLEAR — the user wants to clear/reset/remove all filters:
-    ACTION: clear
-
-4. INSIGHT — the user asks a question about the data, wants analysis, trends,
-   comparisons, summaries, insights, or any question that should be answered
-   using the report data. Examples: "give me an insight", "what's the cancellation rate?",
-   "how is Delta performing?", "summarize the data", "any anomalies?".
-    ACTION: insight
-
-5. NONE — the message is a greeting, off-topic, or truly unrelated:
-    ACTION: none
-    MESSAGE: [your helpful response]
-
-6. Fuzzy airline matching — if the user mentions an airline name but it's not exact,
-   match it to the closest one.
-   For example: "Delta" → "Delta Air Lines Inc.", "Southwest" → "Southwest Airlines Co."
-
-IMPORTANT: If there is ANY doubt whether the user is asking about the data vs.
-requesting a filter change, choose ACTION: insight. Only use ACTION: filter when
-the user EXPLICITLY asks to change/set/show a specific filter.
-
-FOLLOW-UP DETECTION: If the user's message is a follow-up to a previous
-insight/analysis (e.g., "tell me more", "why?", "what about that?",
-"elaborate", "and the delays?", "can you explain?", "go deeper",
-"what else?", short clarifying questions, or any message that only makes
-sense in the context of a prior data answer), classify it as ACTION: insight.
-Follow-ups are VERY common — when in doubt, choose insight.
-
-Always output only the specified keys (ACTION, AIRLINE, DATE_FROM, DATE_TO, MESSAGE) on separate lines.
-"""
-
-    # Build conversation context
-    messages = [{"role": "system", "content": system_prompt}]
-    
-    # Add recent chat history for context (last 4 messages)
-    # Skip the very last entry if it's the same user message we're about to add
-    history_slice = chat_history[-5:]
-    if history_slice and history_slice[-1].get("role") == "user" and history_slice[-1].get("content") == user_message:
+    # Convert recent chat history to LangChain messages (last 4 entries)
+    history_slice = chat_history[-4:]
+    if (
+        history_slice
+        and history_slice[-1].get("role") == "user"
+        and history_slice[-1].get("content") == user_message
+    ):
         history_slice = history_slice[:-1]
-    for msg in history_slice:
-        messages.append({"role": msg["role"], "content": msg["content"]})
-    
-    # If there is an active insight conversation, add a hint so the classifier
-    # knows recent context was data-analysis and follow-ups should be "insight"
-    if insight_history:
-        recent_insight = insight_history[-2:]  # last Q&A pair
-        insight_summary_parts = []
-        for m in recent_insight:
-            role_label = "User" if m["role"] == "user" else "AI"
-            snippet = m["content"][:200]
-            insight_summary_parts.append(f"{role_label}: {snippet}")
-        insight_ctx = "\n".join(insight_summary_parts)
-        messages.append({
-            "role": "system",
-            "content": (
-                "[Context] The user recently had this data-insight conversation:\n"
-                f"{insight_ctx}\n"
-                "If the new message is a follow-up to this, classify as ACTION: insight."
-            ),
-        })
-    
-    messages.append({"role": "user", "content": user_message})
-    
+    chat_msgs = _to_langchain_messages(history_slice)
+
+    # Build insight-context hint so follow-ups are classified correctly
+    insight_hint_msgs: list[BaseMessage] = []
+    if insight_history and len(insight_history) >= 2:
+        last_q = insight_history[-2]["content"][:120]
+        last_a = insight_history[-1]["content"][:120]
+        insight_hint_msgs = [
+            SystemMessage(
+                content=(
+                    f"[Recent insight Q&A] Q: {last_q}… A: {last_a}… "
+                    "— follow-ups → action: insight"
+                )
+            )
+        ]
+
     try:
-        response = llm.invoke(messages)
-        content = response.content if hasattr(response, 'content') else str(response)
-        
-        # Parse the response
-        lines = content.strip().split('\n')
-        result = {"action": "none", "airline": None, "date_from": None, "date_to": None, "message": content}
+        result_obj: IntentClassification = _classify_chain.invoke({
+            "current_airline": current_airline or "All",
+            "current_dates": (
+                f"{current_date_from or DATA_MIN_DATE} to "
+                f"{current_date_to or DATA_MAX_DATE}"
+            ),
+            "airlines_list": ", ".join(VALID_AIRLINES),
+            "chat_history": chat_msgs,
+            "insight_hint": insight_hint_msgs,
+            "user_message": user_message,
+        })
 
-        def normalize_date(s: str):
-            s = s.strip()
-            import re
-            if not s:
-                return None
-            # If already ISO-like
-            try:
-                import datetime as _dt
-                min_d = _dt.date.fromisoformat(DATA_MIN_DATE)
-                max_d = _dt.date.fromisoformat(DATA_MAX_DATE)
-            except Exception:
-                min_d = None
-                max_d = None
-
-            if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
-                try:
-                    d = _dt.date.fromisoformat(s)
-                except Exception:
-                    return None
-                if min_d and d < min_d:
-                    d = min_d
-                if max_d and d > max_d:
-                    d = max_d
-                return d.isoformat()
-
-            # Try to parse common formats using dateutil if available
-            try:
-                from dateutil import parser
-                dt = parser.parse(s)
-                d = dt.date()
-                if min_d and d < min_d:
-                    d = min_d
-                if max_d and d > max_d:
-                    d = max_d
-                return d.isoformat()
-            except Exception:
-                # Fallback: attempt to extract YYYY-MM-DD
-                m = re.search(r"(\d{4}-\d{2}-\d{2})", s)
-                if m:
-                    try:
-                        d = _dt.date.fromisoformat(m.group(1))
-                        if min_d and d < min_d:
-                            d = min_d
-                        if max_d and d > max_d:
-                            d = max_d
-                        return d.isoformat()
-                    except Exception:
-                        return None
-            return None
-
-        for line in lines:
-            if line.startswith("ACTION:"):
-                result["action"] = line.replace("ACTION:", "").strip().lower()
-            elif line.startswith("AIRLINE:"):
-                airline = line.replace("AIRLINE:", "").strip()
-                # Validate airline exists
-                if airline in VALID_AIRLINES:
-                    result["airline"] = airline
-                else:
-                    # Fuzzy match
-                    for valid in VALID_AIRLINES:
-                        if airline and (airline.lower() in valid.lower() or valid.lower() in airline.lower()):
-                            result["airline"] = valid
-                            break
-            elif line.startswith("DATE_FROM:"):
-                df = line.replace("DATE_FROM:", "").strip()
-                result["date_from"] = normalize_date(df)
-            elif line.startswith("DATE_TO:"):
-                dt = line.replace("DATE_TO:", "").strip()
-                result["date_to"] = normalize_date(dt)
-            elif line.startswith("MESSAGE:"):
-                result["message"] = line.replace("MESSAGE:", "").strip()
-
-        return result
+        elapsed = round((time.perf_counter() - t0) * 1000)
+        return {
+            "action": result_obj.action.lower().strip(),
+            "airline": (
+                _fuzzy_match_airline(result_obj.airline)
+                if result_obj.airline
+                else None
+            ),
+            "date_from": (
+                _normalize_date(result_obj.date_from)
+                if result_obj.date_from
+                else None
+            ),
+            "date_to": (
+                _normalize_date(result_obj.date_to)
+                if result_obj.date_to
+                else None
+            ),
+            "message": result_obj.message or "",
+            "elapsed_ms": elapsed,
+        }
     except Exception as e:
-        return {"action": "none", "airline": None, "message": f"Error processing request: {str(e)}"}
+        elapsed = round((time.perf_counter() - t0) * 1000)
+        return {
+            "action": "none",
+            "airline": None,
+            "date_from": None,
+            "date_to": None,
+            "message": f"Error processing request: {str(e)}",
+            "elapsed_ms": elapsed,
+        }
 
 
-def analyze_with_data(user_message: str, insight_history: list, data_summary: str) -> str:
-    """Insight Agent — answers data questions using the actual report data.
+# ══════════════════════════════════════════════════════════════════
+#  INSIGHT ANALYSIS — LCEL Chain with streaming support
+# ══════════════════════════════════════════════════════════════════
 
-    This agent has its OWN conversation history (``insight_history``),
-    separate from the filter/router chat, so it stays focused on
-    data analysis without being polluted by filter commands.
-
-    ``data_summary`` is the plain-text block produced by
-    ``powerbi_data.format_data_for_ai()``.
-    """
-    system_prompt = f"""You are a specialised **Aviation Data Analyst AI** with operational expertise.
+_INSIGHT_SYSTEM_TEMPLATE = """\
+You are a specialised **Aviation Data Analyst AI** with operational expertise.
 
 You are embedded inside a Power BI flight-report dashboard.  The viewer has
 applied certain filters (airline and/or date range) and the data below
@@ -231,7 +304,12 @@ represents EXACTLY what they are currently seeing.
    • **Executive Summary** (2-3 sentences): headline performance with health badges
    • **Key Metrics**: total flights, cancellation rate vs target, avg delay per flight
    • **KPI Health Check**: reference the health badges (🟢/🟡/🔴) from the data
-   • **Top Delay Contributors**: rank delay types by share, highlight the dominant cause
+   • **Delay Causes Analysis** (ALWAYS present as ONE consolidated section — do NOT scatter delay info across other sections):
+     - Start with the 2 outcome metrics: Departure Delay and Arrival Delay (total minutes and avg per flight)
+     - Then list ALL 5 root-cause delay types (Late Aircraft, Airline, Weather, Air System, Security) ranked highest to lowest
+     - For each root cause show: % share among causes, % of total departure delay, total minutes, avg per flight
+     - Identify the #1 and #2 dominant causes and their combined share
+     - Total delay types presented = 7 (2 outcomes + 5 root causes)
    • **Cancellation Analysis**: breakdown by reason with the leading driver
    • **Trend Direction**: whether metrics are improving ↑ or deteriorating ↓
    • **Monthly Highlights**: best and worst performing months
@@ -263,29 +341,80 @@ represents EXACTLY what they are currently seeing.
    follow-up (e.g., "tell me more", "what about …?", "why?", "elaborate",
    "and the delays?"), use the conversation history to understand what
    they are referring to and provide a deeper or related analysis.
-9. **Filter hints** — if a deeper drill-down would help, suggest the user
+9. **Delay reporting rule** — ALWAYS group ALL 7 delay metrics into a single **Delay Causes Analysis**
+    section. Never split delay discussion across other sections. Structure it as:
+
+    **Outcome Metrics** (what was experienced):
+      - Departure Delay: X min total | Y min/flight
+      - Arrival Delay: X min total | Y min/flight
+
+    **Root Causes** (why delays happened) — ranked highest to lowest:
+      1. Late Aircraft Delay — XX.X% of causes | XX.X% of dep delay | X,XXX,XXX min | X.X min/flight
+      2. Airline Delay       — XX.X% of causes | XX.X% of dep delay | X,XXX,XXX min | X.X min/flight
+      3. Air System Delay    — XX.X% of causes | XX.X% of dep delay | X,XXX,XXX min | X.X min/flight
+      4. Weather Delay       — XX.X% of causes | XX.X% of dep delay | X,XXX,XXX min | X.X min/flight
+      5. Security Delay      — XX.X% of causes | XX.X% of dep delay | X,XXX,XXX min | X.X min/flight
+
+    Always close with: "#1 + #2 causes together = XX.X% of root cause delay minutes."
+    This keeps the insight clean, complete (all 7 shown), and avoids delay data being scattered.
+10. **Filter hints** — if a deeper drill-down would help, suggest the user
    change filters (e.g., "Try filtering to a specific month for more detail").
-10. **Risk Escalation** — for any 🔴 CRITICAL KPIs, explicitly flag them as
+11. **Risk Escalation** — for any 🔴 CRITICAL KPIs, explicitly flag them as
     requiring management attention and provide the specific SOP actions.
-11. **Never report missing sections** — if a data category (e.g., flight
+12. **Never report missing sections** — if a data category (e.g., flight
     volume goal, monthly breakdown) has no rows in the data context above,
     simply do not mention it.  Do NOT output sentences like "No data for …"
     or "Unable to specify …".  Only discuss what IS present.
 """
 
-    messages = [{"role": "system", "content": system_prompt}]
+_insight_prompt = ChatPromptTemplate.from_messages([
+    ("system", _INSIGHT_SYSTEM_TEMPLATE),
+    MessagesPlaceholder("history"),
+    ("human", "{user_message}"),
+])
 
-    # Use insight-specific history (no filter noise)
-    for msg in insight_history[-8:]:
-        messages.append({"role": msg["role"], "content": msg["content"]})
+# LCEL chain: prompt → LLM → extract text content
+_insight_chain = _insight_prompt | llm | StrOutputParser()
 
-    messages.append({"role": "user", "content": user_message})
 
+def analyze_with_data(
+    user_message: str, insight_history: list, data_summary: str,
+) -> tuple[str, int]:
+    """Non-streaming insight call. Returns (text, elapsed_ms)."""
+    t0 = time.perf_counter()
+    history_msgs = _to_langchain_messages(insight_history[-8:])
     try:
-        response = llm.invoke(messages)
-        return response.content if hasattr(response, "content") else str(response)
+        text = _insight_chain.invoke({
+            "data_summary": data_summary,
+            "history": history_msgs,
+            "user_message": user_message,
+        })
+        elapsed = round((time.perf_counter() - t0) * 1000)
+        return text, elapsed
     except Exception as exc:
-        return f"Sorry, I couldn't analyse the data right now: {exc}"
+        elapsed = round((time.perf_counter() - t0) * 1000)
+        return f"Sorry, I couldn't analyse the data right now: {exc}", elapsed
 
 
-__all__ = ["extract_airline_filter", "analyze_with_data"]
+def analyze_with_data_stream(
+    user_message: str, insight_history: list, data_summary: str,
+):
+    """Streaming insight generator — yields text chunks.
+
+    Uses LCEL chain streaming: prompt → LLM → StrOutputParser.
+    Each chunk is a plain string, compatible with ``st.write_stream()``.
+    """
+    history_msgs = _to_langchain_messages(insight_history[-8:])
+    try:
+        for chunk in _insight_chain.stream({
+            "data_summary": data_summary,
+            "history": history_msgs,
+            "user_message": user_message,
+        }):
+            if chunk:
+                yield chunk
+    except Exception as exc:
+        yield f"\n\nSorry, I couldn't analyse the data right now: {exc}"
+
+
+__all__ = ["extract_airline_filter", "analyze_with_data", "analyze_with_data_stream"]

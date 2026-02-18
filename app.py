@@ -1,11 +1,12 @@
 import streamlit as st
 import requests
+import time
 
 # Must be first Streamlit command
 st.set_page_config(page_title="AI Flight Report", layout="wide")
 
 from app_lib.config import *
-from app_lib.ai import extract_airline_filter, analyze_with_data
+from app_lib.ai import extract_airline_filter, analyze_with_data, analyze_with_data_stream
 from app_lib.powerbi import get_aad_token, get_embed_params, render_powerbi_report
 from app_lib.powerbi_data import (
     get_dataset_id,
@@ -39,8 +40,11 @@ for key, default in _defaults.items():
 
 
 # ── Helper: fetch / refresh report data ───────────────────────────
-def _refresh_report_data():
-    """Fetch report data for the current filter state and cache it."""
+def _refresh_report_data() -> int:
+    """Fetch report data for the current filter state and cache it.
+    Returns elapsed time in milliseconds.
+    """
+    t0 = time.perf_counter()
     airline = st.session_state.current_airline_filter
     d_from = st.session_state.current_date_from
     d_to = st.session_state.current_date_to
@@ -48,7 +52,7 @@ def _refresh_report_data():
 
     # Skip if data is already up-to-date for these filters
     if st.session_state.data_filters_key == new_key and st.session_state.report_data:
-        return
+        return round((time.perf_counter() - t0) * 1000)
 
     try:
         aad_token = get_aad_token()
@@ -99,11 +103,16 @@ Your workspace appears to lack this. Options:
         with st.sidebar:
             st.error(f"❌ Failed to fetch data: {exc}")
 
+    return round((time.perf_counter() - t0) * 1000)
 
 # ── Sidebar ───────────────────────────────────────────────────────
 with st.sidebar:
     st.header("💬 AI Assistant")
-    st.markdown("Ask me to filter the report **or** ask questions about the data!")
+    st.markdown(
+        "Just type naturally — I'll figure out if you want to **filter** "
+        "the report or **ask a question** about the data!"
+    )
+    st.caption("Examples: *\"show me Delta\"*, *\"what's the delay trend?\"*, *\"flights in March\"*")
     st.divider()
     
     # Current filter status
@@ -135,16 +144,8 @@ with st.sidebar:
     else:
         st.info("No filters active")
     
-    st.divider()
     
     # Data status indicator & manual refresh button
-    if st.button("🔄 Test Data Fetch", use_container_width=True, help="Manually fetch data from Power BI to test connection"):
-        with st.spinner("Fetching data from Power BI..."):
-            # Force refresh by clearing cache
-            st.session_state.report_data = None
-            st.session_state.data_filters_key = None
-            _refresh_report_data()
-        st.rerun()
     
     if st.session_state.report_data:
         errs = st.session_state.report_data.get("errors", [])
@@ -175,23 +176,39 @@ with st.sidebar:
                 st.markdown(f"**AI:** {msg['content']}")
     
     # Chat input
-    user_input = st.chat_input("Type your request...", key="chat_input")
+    user_input = st.chat_input("Ask anything — e.g. 'show me Delta' or 'how are cancellations?'", key="chat_input")
     
     if user_input:
         # Add user message to history
         st.session_state.chat_history.append({"role": "user", "content": user_input})
-        
+
+        # Show user message immediately in the chat area
+        with chat_container:
+            st.markdown(f"**You:** {user_input}")
+            _status_placeholder = st.empty()
+            _status_placeholder.info("🧠 Understanding your request…")
+
         # 1. Determine intent (filter / clear / insight / other)
-        with st.spinner("Processing..."):
-            result = extract_airline_filter(
-                user_input,
-                st.session_state.chat_history,
-                current_airline=st.session_state.current_airline_filter,
-                current_date_from=st.session_state.current_date_from,
-                current_date_to=st.session_state.current_date_to,
-                insight_history=st.session_state.insight_history,
-            )
+        result = extract_airline_filter(
+            user_input,
+            st.session_state.chat_history,
+            current_airline=st.session_state.current_airline_filter,
+            current_date_from=st.session_state.current_date_from,
+            current_date_to=st.session_state.current_date_to,
+            insight_history=st.session_state.insight_history,
+        )
+        classify_ms = result.get("elapsed_ms", 0)
+
+        # Clear status for non-insight actions (insight will update it)
+        if result.get("action") != "insight":
+            _status_placeholder.empty()
         
+        # Helper: format elapsed time badge
+        def _time_badge(label: str, ms: int) -> str:
+            if ms < 1000:
+                return f"⏱ {label}: {ms}ms"
+            return f"⏱ {label}: {ms / 1000:.1f}s"
+
         # 2. Handle the result
         if result.get("action") == "filter":
             parts = []
@@ -233,7 +250,8 @@ with st.sidebar:
             else:
                 response = result.get("message") or "No filters detected."
 
-            st.session_state.chat_history.append({"role": "assistant", "content": response})
+            timing_info = _time_badge("Processed", classify_ms)
+            st.session_state.chat_history.append({"role": "assistant", "content": f"{response}\n\n`{timing_info}`"})
 
             # Invalidate cached data so next insight question fetches fresh data
             st.session_state.report_data = None
@@ -245,7 +263,8 @@ with st.sidebar:
             st.session_state.current_airline_filter = None
             st.session_state.current_date_from = DATA_MIN_DATE
             st.session_state.current_date_to = DATA_MAX_DATE
-            response = "✅ Filters cleared. Showing all airlines (2015-01-01 to 2015-12-31)."
+            timing_info = _time_badge("Processed", classify_ms)
+            response = f"✅ Filters cleared. Showing all airlines (2015-01-01 to 2015-12-31).\n\n`{timing_info}`"
             st.session_state.chat_history.append({"role": "assistant", "content": response})
 
             # Invalidate cached data
@@ -254,10 +273,43 @@ with st.sidebar:
             st.session_state.insight_history = []
 
         elif result.get("action") == "insight":
-            # Data / insight question ─ fetch data on-demand then analyse
-            with st.spinner("Fetching report data…"):
-                _refresh_report_data()
+            # ── Stage 1: Apply implied filters from the question ──
+            implied_parts = []
+            filter_changed = False
 
+            if result.get("airline") and result["airline"] != st.session_state.current_airline_filter:
+                st.session_state.current_airline_filter = result["airline"]
+                implied_parts.append(f"**{result['airline']}**")
+                filter_changed = True
+
+            if result.get("date_from") and result["date_from"] != st.session_state.current_date_from:
+                st.session_state.current_date_from = result["date_from"]
+                implied_parts.append(f"from **{result['date_from']}**")
+                filter_changed = True
+
+            if result.get("date_to") and result["date_to"] != st.session_state.current_date_to:
+                st.session_state.current_date_to = result["date_to"]
+                implied_parts.append(f"to **{result['date_to']}**")
+                filter_changed = True
+
+            if filter_changed:
+                # Invalidate cache since filters changed
+                st.session_state.report_data = None
+                st.session_state.data_filters_key = None
+                st.session_state.insight_history = []
+                filter_note = "🎯 Auto-filtered to " + ", ".join(implied_parts)
+                st.session_state.chat_history.append({"role": "assistant", "content": filter_note})
+                # Show filter note immediately in chat
+                with chat_container:
+                    st.markdown(f"**AI:** {filter_note}")
+
+            # ── Stage 2: Fetch data with progress indicator ──
+            _status_placeholder.info("📊 Fetching report data…")
+            t_data = time.perf_counter()
+            _refresh_report_data()
+            data_ms = round((time.perf_counter() - t_data) * 1000)
+
+            # ── Stage 3: Stream the AI insight response into chat ──
             if st.session_state.report_data and not st.session_state.report_data.get("errors"):
                 data_summary = format_data_for_ai(
                     st.session_state.report_data,
@@ -265,26 +317,52 @@ with st.sidebar:
                     st.session_state.current_date_from,
                     st.session_state.current_date_to,
                 )
-                with st.spinner("Analysing data…"):
-                    response = analyze_with_data(
-                        user_input,
-                        st.session_state.insight_history,
-                        data_summary,
+
+                _status_placeholder.info("🧠 Analyzing your data…")
+                t_insight = time.perf_counter()
+                with chat_container:
+                    _status_placeholder.empty()
+                    full_response = st.write_stream(
+                        analyze_with_data_stream(
+                            user_input,
+                            st.session_state.insight_history,
+                            data_summary,
+                        )
                     )
-                # Track in insight-specific history
+                insight_ms = round((time.perf_counter() - t_insight) * 1000)
+
+                # Build timing footer
+                timing_parts = [
+                    _time_badge("Classify", classify_ms),
+                    _time_badge("Data", data_ms),
+                    _time_badge("Analysis", insight_ms),
+                ]
+                total_ms = classify_ms + data_ms + insight_ms
+                timing_parts.append(_time_badge("Total", total_ms))
+                timing_footer = " | ".join(timing_parts)
+
+                final_response = f"{full_response}\n\n`{timing_footer}`"
+
+                # Track in insight-specific history (without timing)
                 st.session_state.insight_history.append({"role": "user", "content": user_input})
-                st.session_state.insight_history.append({"role": "assistant", "content": response})
+                st.session_state.insight_history.append({"role": "assistant", "content": full_response})
+                st.session_state.chat_history.append({"role": "assistant", "content": final_response})
+
             elif st.session_state.report_data and st.session_state.report_data.get("errors"):
+                _status_placeholder.empty()
                 errs = "; ".join(st.session_state.report_data["errors"])
                 response = f"I couldn't fetch the report data: {errs}"
+                st.session_state.chat_history.append({"role": "assistant", "content": response})
             else:
+                _status_placeholder.empty()
                 response = "I couldn't retrieve report data. Please try again."
-            st.session_state.chat_history.append({"role": "assistant", "content": response})
+                st.session_state.chat_history.append({"role": "assistant", "content": response})
 
         else:
             # Truly unrelated / greeting — use the LLM's own message
             response = result.get("message", "I'm here to help with your flight report! Ask me for insights or to filter the data.")
-            st.session_state.chat_history.append({"role": "assistant", "content": response})
+            timing_info = _time_badge("Processed", classify_ms)
+            st.session_state.chat_history.append({"role": "assistant", "content": f"{response}\n\n`{timing_info}`"})
         
         st.rerun()
     
