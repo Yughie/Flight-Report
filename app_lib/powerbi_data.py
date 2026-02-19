@@ -17,6 +17,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .config import WORKSPACE_ID
+from .sop_search import get_sop_references_for_issues, search_skybrary_sop
 
 # Module-level cache for airline list (never changes within a session)
 _airline_list_cache: list[str] | None = None
@@ -311,6 +312,9 @@ _CANCEL_CODE_LABELS = {
     "B": "Weather",
     "C": "National Air System",
     "D": "Security",
+    "NOT CANCELLED": "Not Cancelled",  # literal string stored in the column
+    "": "Not Cancelled",               # blank fallback
+    None: "Not Cancelled",             # null fallback
 }
 
 
@@ -320,24 +324,18 @@ def fetch_cancellation_breakdown(
 ) -> list:
     """Cancellation count per reason.
 
-    Queries the raw 'flights'[CANCELLATION_REASON] codes (A/B/C/D)
-    directly from the flights table and sums 'flights'[CANCELLED].
-    Date and airline filters are applied via the gold_aviation_report
-    table using TREATAS so the model relationships are respected.
-    Labels are mapped to readable names in Python after the query.
+    Uses 'gold_aviation_report'[CANCELLATION_REASON] which contains the raw
+    codes A / B / C / D for cancelled flights and the literal string
+    "Not Cancelled" for flights that were not cancelled.
+    SUM([CANCELLED]) is used so "Not Cancelled" rows correctly return 0
+    and don't inflate the total used in SOP / share calculations.
+
+    Labels are mapped to readable names in Python after the query:
+      A → Airline/Carrier, B → Weather, C → National Air System,
+      D → Security, "Not Cancelled" / blank / None → Not Cancelled
     """
     var_parts: list[str] = []
     sc_refs: list[str] = []
-
-    # Only include the four real cancellation codes — exclude "Not Cancelled" / blanks
-    var_parts.append(
-        '    VAR __CancelCodesFilter =\n'
-        '        FILTER(\n'
-        '            KEEPFILTERS(VALUES(\'flights\'[CANCELLATION_REASON])),\n'
-        '            \'flights\'[CANCELLATION_REASON] IN {"A", "B", "C", "D"}\n'
-        '        )'
-    )
-    sc_refs.append("__CancelCodesFilter")
 
     if date_from or date_to:
         cond = _date_condition(date_from, date_to)
@@ -359,34 +357,48 @@ def fetch_cancellation_breakdown(
         )
         sc_refs.append("__AirlineFilter")
 
-    sc_filter_str = ",\n            ".join(sc_refs)
+    # Build optional filter args for SUMMARIZECOLUMNS (with trailing comma so
+    # the final filter var is followed by a comma before "SumCANCELLED").
+    sc_filter_line = ""
+    if sc_refs:
+        sc_filter_line = (
+            "            " + ",\n            ".join(sc_refs) + ",\n"
+        )
 
-    var_parts.append(
+    core_block = (
         "    VAR __Core =\n"
         "        SUMMARIZECOLUMNS(\n"
-        "            'flights'[CANCELLATION_REASON],\n"
-        f"            {sc_filter_str},\n"
-        '            "SumCANCELLED", SUM(\'flights\'[CANCELLED])\n'
+        "            'gold_aviation_report'[CANCELLATION_REASON],\n"
+        f"{sc_filter_line}"
+        '            "SumCANCELLED", SUM(\'gold_aviation_report\'[CANCELLED])\n'
         "        )\n"
         "\n"
         "    VAR __Limited =\n"
-        "        TOPN(1002, __Core, [SumCANCELLED], 0, 'flights'[CANCELLATION_REASON], 1)"
+        "        TOPN(1002, __Core, [SumCANCELLED], 0,\n"
+        "             'gold_aviation_report'[CANCELLATION_REASON], 1)"
     )
+    var_parts.append(core_block)
 
     define = "DEFINE\n" + "\n\n".join(var_parts) + "\n\n"
     query = (
         f"{define}"
         "EVALUATE __Limited\n"
-        "ORDER BY [SumCANCELLED] DESC, 'flights'[CANCELLATION_REASON]\n"
+        "ORDER BY [SumCANCELLED] DESC, 'gold_aviation_report'[CANCELLATION_REASON]\n"
     )
     raw_rows = execute_dax(token, ds_id, query)
 
-    # Map raw letter codes to readable labels so downstream consumers
-    # can use row["CANCELLATION REASON"] as before.
+    # Map raw letter codes / blanks to readable labels.
     result = []
     for row in raw_rows:
-        code = row.get("CANCELLATION_REASON") or ""
-        label = _CANCEL_CODE_LABELS.get(code.upper(), code or "Unknown")
+        code = row.get("CANCELLATION_REASON")           # may be None or ""
+        code_str = (code or "").strip().upper()
+        label = (
+            _CANCEL_CODE_LABELS.get(code)               # None key match
+            or _CANCEL_CODE_LABELS.get(code_str)        # "A" / "B" / …
+            or _CANCEL_CODE_LABELS.get("")               # blank fallback
+            or code_str
+            or "Unknown"
+        )
         result.append({
             "CANCELLATION REASON": label,
             "SumCANCELLED": row.get("SumCANCELLED", 0) or 0,
@@ -755,13 +767,18 @@ def _build_sop_recommendations(
     otp_monthly: dict | None = None,
     cancel_monthly: dict | None = None,
     vol_monthly: dict | None = None,
-) -> list[str]:
+) -> tuple[list[str], list[str]]:
     """Generate actionable SOP recommendations based on KPI health.
 
-    Mirrors the approach from azure_context.append_kpi_context() but
-    applied to the DAX data pipeline with concrete operational guidance.
+    Now returns BOTH the textual SOP lines AND a list of issue topic keys
+    that can be used to fetch SKYbrary references via Tavily search.
+
+    Returns
+    -------
+    (sop_lines, issue_topics) : tuple[list[str], list[str]]
     """
     sops: list[str] = []
+    issue_topics: list[str] = []  # collect topics for SKYbrary search
     dr = data.get("date_range") or {}
     ds = data.get("delay_summary") or {}
     cb = data.get("cancellation_breakdown") or []
@@ -769,9 +786,9 @@ def _build_sop_recommendations(
     total_cancelled = dr.get("TotalCancelled") or 0
     cancel_rate = (total_cancelled / total_flights) if total_flights > 0 else None
 
-    # ── 1. Cancellation Rate SOP ──
+    # ── 1. Cancellation Rate Issues ──
     if cancel_rate is not None and cancel_rate > KPI_GOALS["cancellation_target"]:
-        sops.append("─── SOP: HIGH CANCELLATION RATE ───")
+        sops.append("─── ISSUE: HIGH CANCELLATION RATE ───")
         sops.append(f"  Observed: {cancel_rate:.2%} vs Target: {KPI_GOALS['cancellation_target']:.0%}")
 
         # Identify dominant cancellation reason
@@ -789,26 +806,16 @@ def _build_sop_recommendations(
                 sops.append(f"  ▸ {reason}: {_fmt(count)} flights ({share:.1f}% of cancellations)")
 
                 if "weather" in reason_lower:
-                    sops.append("    → SOP-W1: Enhance weather forecasting integration with ops planning (48h / 24h / 6h horizons)")
-                    sops.append("    → SOP-W2: Pre-position spare aircraft at weather-vulnerable hubs")
-                    sops.append("    → SOP-W3: Establish proactive rebooking protocols when weather advisories issued")
-                    sops.append("    → SOP-W4: Review de-icing capacity and winter operations readiness")
+                    issue_topics.append("cancellation_weather")
                 elif "carrier" in reason_lower or "airline" in reason_lower:
-                    sops.append("    → SOP-C1: Audit maintenance scheduling — identify pattern of MEL deferrals causing cancellations")
-                    sops.append("    → SOP-C2: Review crew reserve ratios vs. flight schedule density")
-                    sops.append("    → SOP-C3: Implement crew fatigue risk management and scheduling buffers")
-                    sops.append("    → SOP-C4: Escalate recurring aircraft-type issues to fleet engineering")
+                    issue_topics.append("cancellation_airline")
                 elif "national air system" in reason_lower or "nas" in reason_lower:
-                    sops.append("    → SOP-N1: Coordinate with ATC for slot optimization at congested airports")
-                    sops.append("    → SOP-N2: Review alternate routing options for high-congestion corridors")
-                    sops.append("    → SOP-N3: Engage in FAA CDM (Collaborative Decision Making) programmes")
+                    issue_topics.append("cancellation_nas")
                 elif "security" in reason_lower:
-                    sops.append("    → SOP-S1: Liaise with TSA on checkpoint throughput improvements")
-                    sops.append("    → SOP-S2: Review gate-hold procedures during security incidents")
-                    sops.append("    → SOP-S3: Assess whether security-driven cancellations correlate with specific airports")
+                    issue_topics.append("cancellation_security")
         sops.append("")
 
-    # ── 2. On-Time Performance SOP ──
+    # ── 2. On-Time Performance Issues ──
     if otp_monthly:
         avg_otp_vals = [v.get("On_Time_Performance", 0) or 0 for v in otp_monthly.values()]
         avg_otp = sum(avg_otp_vals) / len(avg_otp_vals) if avg_otp_vals else None
@@ -816,49 +823,24 @@ def _build_sop_recommendations(
         avg_otp = None
 
     if avg_otp is not None and avg_otp < KPI_GOALS["otp_target"]:
-        sops.append("─── SOP: LOW ON-TIME PERFORMANCE ───")
+        sops.append("─── ISSUE: LOW ON-TIME PERFORMANCE ───")
         sops.append(f"  Observed avg: {avg_otp:.1%} vs Target: {KPI_GOALS['otp_target']:.0%}")
+        issue_topics.append("otp_low")
 
-        # Break down by delay type to give targeted SOPs
-        delay_types = {
-            "SumDEPARTURE_DELAY": ("Departure Delay", [
-                "→ SOP-D1: Review turnaround time standards — identify stations with chronic late departures",
-                "→ SOP-D2: Optimize boarding process (zone boarding, early boarding for families/assist)",
-                "→ SOP-D3: Reduce ground time gaps — pre-stage catering, cleaning, fueling",
-                "→ SOP-D4: Implement gate conflict resolution at hub airports",
-            ]),
-            "SumLATE_AIRCRAFT_DELAY": ("Late Aircraft Delay", [
-                "→ SOP-LA1: Add schedule buffer (padding) on high-utilisation aircraft rotations",
-                "→ SOP-LA2: Identify aircraft 'chains' where a single late arrival cascades into 3+ delays",
-                "→ SOP-LA3: Strategic spare aircraft placement at top-10 busiest stations",
-                "→ SOP-LA4: Monitor aircraft swap effectiveness — track if swaps resolve or shift delays",
-            ]),
-            "SumAIRLINE_DELAY": ("Airline Delay", [
-                "→ SOP-AL1: Root-cause analysis on maintenance-induced delays — scheduled vs unscheduled",
-                "→ SOP-AL2: Review crew scheduling rules — minimum rest gaps, deadheading efficiency",
-                "→ SOP-AL3: Assess baggage handling and ramp operation bottlenecks",
-                "→ SOP-AL4: Weekly ops review meetings with station managers for top-offending stations",
-            ]),
-            "SumWEATHER_DELAY": ("Weather Delay", [
-                "→ SOP-WD1: Cross-reference delays with weather severity — identify over-cautious ground stops",
-                "→ SOP-WD2: Diversify hub operations to reduce dependency on weather-prone airports",
-                "→ SOP-WD3: Seasonal readiness checklist (winter de-icing, summer thunderstorm protocols)",
-            ]),
-            "SumAIR_SYSTEM_DELAY": ("Air System / ATC Delay", [
-                "→ SOP-AS1: Participate in FAA Traffic Flow Management (TFM) initiatives",
-                "→ SOP-AS2: Evaluate RNAV/RNP approach capability to reduce ATC-dependent sequencing",
-                "→ SOP-AS3: Lobby for NextGen airspace modernisation at chronic-delay airports",
-            ]),
-            "SumSECURITY_DELAY": ("Security Delay", [
-                "→ SOP-SD1: Track security delay frequency by airport — escalate outliers to TSA liaison",
-                "→ SOP-SD2: Review if pre-check / CLEAR adoption rates can reduce screening delays",
-            ]),
+        # Map delay types to search topics
+        delay_topic_map = {
+            "SumDEPARTURE_DELAY": ("Departure Delay", "delay_departure"),
+            "SumLATE_AIRCRAFT_DELAY": ("Late Aircraft Delay", "delay_late_aircraft"),
+            "SumAIRLINE_DELAY": ("Airline Delay", "delay_airline"),
+            "SumWEATHER_DELAY": ("Weather Delay", "delay_weather"),
+            "SumAIR_SYSTEM_DELAY": ("Air System / ATC Delay", "delay_air_system"),
+            "SumSECURITY_DELAY": ("Security Delay", "delay_security"),
         }
 
         if ds:
             # Rank delay types by magnitude
             delay_ranked = sorted(
-                [(k, ds.get(k, 0) or 0) for k in delay_types],
+                [(k, ds.get(k, 0) or 0) for k in delay_topic_map],
                 key=lambda x: x[1],
                 reverse=True,
             )
@@ -867,13 +849,12 @@ def _build_sop_recommendations(
                 share = minutes / total_delay * 100
                 if share < 5:
                     continue
-                label, actions = delay_types[key]
+                label, topic = delay_topic_map[key]
                 sops.append(f"  ▸ {label}: {_fmt(minutes)} min ({share:.1f}% of total delay)")
-                for a in actions:
-                    sops.append(f"    {a}")
+                issue_topics.append(topic)
         sops.append("")
 
-    # ── 3. Flight Volume SOP ──
+    # ── 3. Flight Volume Issues ──
     if vol_monthly:
         months_below = []
         for m in sorted(vol_monthly):
@@ -883,39 +864,40 @@ def _build_sop_recommendations(
                 gap = goal - actual
                 months_below.append((m, actual, goal, gap))
         if months_below:
-            sops.append("─── SOP: FLIGHT VOLUME BELOW GOAL ───")
+            sops.append("─── ISSUE: FLIGHT VOLUME BELOW GOAL ───")
             for m, actual, goal, gap in months_below:
                 label = MONTH_LABELS.get(m[-2:], m)
                 sops.append(f"  ▸ {m} ({label}): Actual={_fmt(actual)} vs Goal={_fmt(goal)} (shortfall: {_fmt(gap)})")
-            sops.append("  → SOP-FV1: Review demand forecasting accuracy — compare forecast vs actual bookings")
-            sops.append("  → SOP-FV2: Evaluate route profitability — assess if underperforming routes need schedule adjustments")
-            sops.append("  → SOP-FV3: Analyse competitive landscape — check if competitors added capacity on same routes")
-            sops.append("  → SOP-FV4: Review cancellation contribution — some shortfall may be from cancelled flights (see cancellation SOPs)")
+            issue_topics.append("flight_volume")
             sops.append("")
 
-    # ── 4. Delay Dominance SOP (single cause > 40%) ──
+    # ── 4. Delay Dominance Alert (single cause > 40%) ──
     if ds:
         controllable_delays = {
-            "SumLATE_AIRCRAFT_DELAY": "Late Aircraft",
-            "SumAIRLINE_DELAY": "Airline/Carrier",
-            "SumWEATHER_DELAY": "Weather",
-            "SumAIR_SYSTEM_DELAY": "Air System/ATC",
-            "SumSECURITY_DELAY": "Security",
+            "SumLATE_AIRCRAFT_DELAY": ("Late Aircraft", "delay_late_aircraft"),
+            "SumAIRLINE_DELAY": ("Airline/Carrier", "delay_airline"),
+            "SumWEATHER_DELAY": ("Weather", "delay_weather"),
+            "SumAIR_SYSTEM_DELAY": ("Air System/ATC", "delay_air_system"),
+            "SumSECURITY_DELAY": ("Security", "delay_security"),
         }
         total_ctrl = sum(ds.get(k, 0) or 0 for k in controllable_delays)
         if total_ctrl > 0:
-            for key, label in controllable_delays.items():
+            for key, (label, topic) in controllable_delays.items():
                 val = ds.get(key, 0) or 0
                 share = val / total_ctrl * 100
                 if share > 40:
-                    sops.append(f"─── SOP: DOMINANT DELAY TYPE — {label.upper()} ({share:.0f}% of delays) ───")
+                    sops.append(f"─── ⚠ DOMINANT DELAY TYPE — {label.upper()} ({share:.0f}% of delays) ───")
                     sops.append(f"  This single cause accounts for >{share:.0f}% of total delay minutes.")
-                    sops.append("  → Concentrate mitigation resources on this category (see specific SOPs above).")
-                    sops.append("  → Escalate to VP Operations for executive-level action plan within 48 hours.")
-                    sops.append("  → Establish a dedicated task force or war-room if the trend continues > 2 months.")
+                    sops.append("  → Escalate to VP Operations for executive-level action plan.")
+                    if topic not in issue_topics:
+                        issue_topics.append(topic)
                     sops.append("")
 
-    return sops
+    # Always include general SOP reference
+    if issue_topics:
+        issue_topics.append("general_sop")
+
+    return sops, issue_topics
 
 
 # ── Main formatting function ─────────────────────────────────────
@@ -1196,13 +1178,26 @@ def format_data_for_ai(
             lines.append(f"  {month} ({label}){' ' * (6 - len(label))} {r:>8} {t:>8} {g:>8} {status:>8}")
         lines.append("")
 
-    # ── SOP RECOMMENDATIONS ───────────────────────────────────────
-    sop_lines = _build_sop_recommendations(data, otp_monthly, cancel_monthly, vol_monthly)
+    # ── SOP RECOMMENDATIONS (SKYbrary-referenced) ─────────────────
+    sop_lines, issue_topics = _build_sop_recommendations(data, otp_monthly, cancel_monthly, vol_monthly)
     if sop_lines:
         lines.append("=" * 60)
-        lines.append("  STANDARD OPERATING PROCEDURE (SOP) RECOMMENDATIONS")
+        lines.append("  IDENTIFIED OPERATIONAL ISSUES")
         lines.append("=" * 60)
         lines.extend(sop_lines)
+
+    # Fetch real SOP references from SKYbrary via Tavily search
+    if issue_topics:
+        # De-duplicate topics while preserving order
+        seen = set()
+        unique_topics = []
+        for t in issue_topics:
+            if t not in seen:
+                seen.add(t)
+                unique_topics.append(t)
+        skybrary_refs = get_sop_references_for_issues(unique_topics)
+        if skybrary_refs:
+            lines.append(skybrary_refs)
 
     # ── KPI CONTEXT NOTES (adapted from azure_context.py) ─────────
     lines.append("")

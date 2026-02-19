@@ -319,12 +319,20 @@ represents EXACTLY what they are currently seeing.
    monthly breakdown, NO goal comparison, or NO trend data for a topic,
    OMIT that section entirely.  Do NOT write "No data available" or
    "Unable to determine" — simply skip it.**
-3. **SOP Recommendations** — when metrics are below target, reference the SOP
-   recommendations from the data context. Present them as actionable next steps:
-   • If cancellation rate exceeds target → cite relevant SOP-C/W/N/S codes
-   • If OTP is below target → cite relevant SOP-D/LA/AL/WD/AS codes
-   • If flight volume is below goal → cite SOP-FV codes
+3. **SOP Recommendations** — when metrics are below target, reference the
+   SKYbrary SOP guidance and related articles from the data context.
+   SKYbrary (skybrary.aero) is the authoritative aviation safety knowledge
+   base maintained by EUROCONTROL and industry partners.
+   Present recommendations as actionable next steps grounded in SKYbrary references:
+   • If cancellation rate exceeds target → cite relevant SKYbrary articles on
+     weather disruption, crew management, or NAS procedures
+   • If OTP is below target → cite SKYbrary articles on delay management,
+     turnaround procedures, or ATC coordination
+   • If flight volume is below goal → cite SKYbrary articles on schedule
+     planning and capacity management
    • If one delay type dominates (>40%) → highlight it as a priority focus area
+   When SKYbrary article URLs are provided in the data context, include them
+   as references so the user can read the full SOP guidance.
    Frame SOPs as "Recommended Actions" with urgency level (🔴 Immediate / 🟡 Short-term / 🟢 Monitor).
 4. **Comparisons** — when data includes both actuals and targets/goals,
    explicitly compare them (e.g., "OTP of 78.5% vs target of 80%").
@@ -360,7 +368,8 @@ represents EXACTLY what they are currently seeing.
 10. **Filter hints** — if a deeper drill-down would help, suggest the user
    change filters (e.g., "Try filtering to a specific month for more detail").
 11. **Risk Escalation** — for any 🔴 CRITICAL KPIs, explicitly flag them as
-    requiring management attention and provide the specific SOP actions.
+    requiring management attention and reference the relevant SKYbrary SOP
+    articles from the data context for authoritative procedural guidance.
 12. **Never report missing sections** — if a data category (e.g., flight
     volume goal, monthly breakdown) has no rows in the data context above,
     simply do not mention it.  Do NOT output sentences like "No data for …"
