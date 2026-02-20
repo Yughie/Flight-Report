@@ -1,0 +1,8 @@
+streamlit
+requests
+python-dotenv
+langchain-core
+langchain-openai
+pydantic
+python-dateutil
+tavily-python
