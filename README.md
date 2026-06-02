@@ -105,3 +105,57 @@ Open `http://localhost:8501` in your browser.
 
 - Do not commit `.env` or secrets to source control. Use a secrets store (Azure Key Vault, environment-managed secrets) in production.
 - For production deployment, consider using managed identities, rotating keys, and least-privilege permissions.
+
+## DEPLOYMENT
+
+The application was packaged into a Docker image and deployed to Azure App Service using an Azure Container Registry (ACR). Example steps performed (replace placeholder values where needed):
+
+```bash
+az login
+
+# Create an Azure Container Registry
+az acr create --resource-group powerbi-aidemo --name ernsight --sku Basic
+
+# Build and push the image to ACR
+az acr build --registry ernsight --image streamlit-pbi-ai:v1 .
+
+# Create an App Service plan (Linux)
+az appservice plan create --name pbi-ai-plan --resource-group powerbi-aidemo --is-linux --sku B1
+
+# Create the Web App linked to the ACR image
+az webapp create --resource-group powerbi-aidemo --plan pbi-ai-plan --name ernsight-assistant \
+   --deployment-container-image-name ernsight.azurecr.io/streamlit-pbi-ai:v1
+
+# Enable admin user on ACR (to get credentials)
+az acr update --name ernsight --admin-enabled true
+
+# 1. Get the password from your registry (bash)
+ACR_PASSWORD=$(az acr credential show --name ernsight --query "passwords[0].value" -o tsv)
+
+# 2. Configure the Web App to use the ACR image and credentials (bash)
+az webapp config container set --name ernsight-assistant --resource-group powerbi-aidemo \
+   --docker-custom-image-name ernsight.azurecr.io/streamlit-pbi-ai:v1 \
+   --docker-registry-server-url https://ernsight.azurecr.io \
+   --docker-registry-server-user ernsight \
+   --docker-registry-server-password $ACR_PASSWORD
+
+# (Windows CMD example to capture the ACR password)
+for /f "tokens=*" %i in ('az acr credential show --name ernsight --query "passwords[0].value" -o tsv') do set ACR_PASSWORD=%i
+
+# (Windows CMD: configure the webapp using the captured password)
+az webapp config container set --name ernsight-assistant --resource-group powerbi-aidemo \
+   --docker-custom-image-name ernsight.azurecr.io/streamlit-pbi-ai:v1 \
+   --docker-registry-server-url https://ernsight.azurecr.io \
+   --docker-registry-server-user ernsight \
+   --docker-registry-server-password %ACR_PASSWORD%
+
+# Add required app settings (example: port and API keys)
+az webapp config appsettings set --resource-group powerbi-aidemo --name ernsight-assistant \
+   --settings WEBSITES_PORT=8501 GROQ_API_KEY="your_key" AZURE_OPENAI_API_KEY="your_key"
+
+```
+
+Notes:
+
+- Replace `your_key` with real API keys or configure secrets via Azure Key Vault/managed identities.
+- The image entrypoint uses Streamlit (`app.py`) and listens on port `8501` per the Dockerfile.

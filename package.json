@@ -1,7 +1,8 @@
 {
   "dependencies": {
+    "@langchain/core": "^1.1.48",
     "@langchain/openai": "^1.2.2",
-    "langchain": "^1.2.10",
+    "langchain": "^1.4.4",
     "zod": "^4.3.5"
   }
 }

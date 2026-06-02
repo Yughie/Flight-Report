@@ -29,6 +29,7 @@ VALID_AIRLINES = [
     "Virgin America"
 ]
 
+
 # Dataset timeline bounds (clamp defaults and parsed dates to this range)
 DATA_MIN_DATE = "2015-01-01"
 DATA_MAX_DATE = "2015-12-31"
