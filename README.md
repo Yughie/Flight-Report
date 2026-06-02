@@ -7,7 +7,7 @@ Flight-Report is a Streamlit app that directly queries a Power BI dataset using 
 **Prerequisites:**
 
 - An **Azure AD** App Registration (service principal) with application credentials.
-- Power BI workspace that is **Premium**, **PPU**, or **Embedded**.
+- Power BI workspace that has **Pro Subscription**, **PPU**, or **Embedded**.
 - Service principal must have the appropriate Power BI API application permission (e.g., `Dataset.Read.All`) and admin consent granted.
 - The service principal (or a security group containing it) must be added to the target Power BI Workspace as a Member/Contributor.
 - Python 3.10+ and virtual environment for running the Streamlit app.
